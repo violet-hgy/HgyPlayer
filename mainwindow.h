@@ -11,7 +11,11 @@
 #include <QSlider>
 
 /**
- * @brief 播放器窗口：打开 / 播放 / 暂停 / 停止 / Seek
+ * @brief 主窗口（仅 UI）
+ *
+ * 职责：布局、按钮/进度条交互、把用户操作转发给 FFmpegPlayer，
+ * 并根据播放器信号刷新画面与状态。
+ * 不包含 demux / 解码 / 时钟同步等播放内核逻辑。
  */
 class MainWindow : public QMainWindow
 {
@@ -38,10 +42,11 @@ private slots:
 private:
     void showMediaSummary(const MediaInfo &info);
     void updateTimeLabel();
+    void setTransportEnabled(bool enabled);
     static QString formatTime(qint64 ms);
 
 private:
-    FFmpegPlayer *m_player = nullptr;
+    FFmpegPlayer *m_player = nullptr; ///< 专用播放器封装，所有播放逻辑在其内部
 
     QLabel *m_videoLabel = nullptr;
     QPlainTextEdit *m_infoEdit = nullptr;
@@ -51,8 +56,7 @@ private:
     QSlider *m_seekSlider = nullptr;
     QLabel *m_timeLabel = nullptr;
 
-    bool m_sliderPressed = false;
-    qint64 m_pendingSeekMs = -1; ///< >=0 表示正在等待 seek 生效，忽略过期进度
+    bool m_sliderPressed = false; ///< 拖动进度条时暂停用 position 回写滑块
 };
 
 #endif // MAINWINDOW_H

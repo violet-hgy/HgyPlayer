@@ -2,7 +2,18 @@
 
 /**
  * @file FFmpegPlayer.cpp
- * @brief 播放器实现
+ * @brief 专用播放器实现（FFmpegPlayer 门面 + PlayerWorker 解码线程）
+ *
+ * 本文件集中全部播放内核；MainWindow 不得复制 demux/解码/时钟逻辑。
+ *
+ * 模块划分：
+ *   [解析] openFile / openCodec / buildInfo …… 打开容器、找流、建解码器、填 MediaInfo
+ *   [解复用] runLoop / av_read_frame …… 按包从容器读数据
+ *   [画面] decodeVideo / convertVideoFrame …… 解码视频并转成 QImage
+ *   [音频] decodeAudio / ensureSwrFromFrame …… 解码并重采样为 PCM
+ *   [时钟] updateClock / waitForPts …… 媒体时钟与按 PTS 等待显示
+ *   [Seek] requestSeek / performSeek_l / applySeek …… 跳转并 flush
+ *   [主线程音频] startAudioDevice / pumpAudio …… QAudioSink 出声
  *
  * 音频为什么要放在主线程：
  * - QAudioSink 依赖线程事件循环；Worker 的 runLoop() 会占满线程，导致无声
@@ -46,6 +57,7 @@ extern "C" {
 
 namespace {
 
+/** FFmpeg 错误码转可读字符串 */
 QString avErr(int err)
 {
     char buf[AV_ERROR_MAX_STRING_SIZE] = {0};
@@ -53,6 +65,7 @@ QString avErr(int err)
     return QString::fromUtf8(buf);
 }
 
+/** [时钟] 时间基时间戳 → 毫秒 */
 qint64 tsToMs(qint64 ts, AVRational tb)
 {
     if (ts == AV_NOPTS_VALUE) {
@@ -61,6 +74,7 @@ qint64 tsToMs(qint64 ts, AVRational tb)
     return av_rescale_q(ts, tb, AVRational{1, 1000});
 }
 
+/** [解析] 从 AVStream 填充一条与 FFmpeg 解耦的 MediaStreamInfo */
 MediaStreamInfo makeStreamInfo(AVFormatContext *fmt, int index)
 {
     MediaStreamInfo info;
@@ -155,7 +169,7 @@ private:
 } // namespace
 
 // ============================================================================
-// PlayerWorker
+// PlayerWorker：解码线程对象（demux / 解码 / 时钟 / Seek）
 // ============================================================================
 
 class PlayerWorker : public QObject
@@ -174,6 +188,7 @@ public:
         closeFile();
     }
 
+    /** [音频] 设置主线程音频设备的目标采样率/声道，供 swr 输出对齐 */
     void setOutputAudioFormat(int sampleRate, int channels)
     {
         QMutexLocker lock(&m_mutex);
@@ -185,6 +200,7 @@ public:
         }
     }
 
+    /** [控制] 请求暂停：冻结媒体时钟基准 */
     void requestPause()
     {
         QMutexLocker lock(&m_mutex);
@@ -196,6 +212,7 @@ public:
         emit stateChanged(FFmpegPlayer::State::Paused);
     }
 
+    /** [控制] 请求继续：重启墙钟，与当前媒体时钟对齐 */
     void requestResume()
     {
         QMutexLocker lock(&m_mutex);
@@ -209,9 +226,12 @@ public:
         emit stateChanged(FFmpegPlayer::State::Playing);
     }
 
+    /**
+     * [Seek] 播放中异步请求跳转（任意线程可调）
+     * 只置标志；真正执行在 runLoop → consumeCommands → performSeek_l
+     */
     void requestSeek(qint64 ms)
     {
-        // 任意线程可调：只置标志。播放循环里的 consumeCommands() 会真正执行 seek。
         QMutexLocker lock(&m_mutex);
         if (!m_fmt) {
             return;
@@ -226,6 +246,7 @@ public:
         m_wait.wakeAll();
     }
 
+    /** [控制] 请求中止当前播放循环 */
     void requestAbort()
     {
         QMutexLocker lock(&m_mutex);
@@ -242,6 +263,10 @@ public:
     bool hasAudio() const { return m_audioStream >= 0 && m_adec != nullptr; }
 
 public slots:
+    /**
+     * [解析] 打开媒体文件
+     * 步骤：open_input → find_stream_info → 选音视频流 → openCodec → buildInfo
+     */
     bool openFile(const QString &path)
     {
         closeFile();
@@ -298,6 +323,7 @@ public slots:
         return true;
     }
 
+    /** [解析] 关闭容器与解码器，释放全部 FFmpeg 资源 */
     void closeFile()
     {
         if (m_swr) {
@@ -328,6 +354,10 @@ public slots:
         emit audioReset();
     }
 
+    /**
+     * [控制] 启动播放：进入 demux/解码主循环（阻塞直到 abort 或 EOF）
+     * 必须在 Worker 线程调用（QueuedConnection）
+     */
     void startPlayback()
     {
         if (!m_fmt || m_running.load()) {
@@ -359,6 +389,7 @@ public slots:
         }
     }
 
+    /** [控制] 停止播放并 Seek 回起点（文件保持打开） */
     void stopPlayback()
     {
         requestAbort();
@@ -379,7 +410,10 @@ public slots:
         emit stateChanged(FFmpegPlayer::State::Stopped);
     }
 
-    /** 始终在 Worker 线程调用：处理 seek（播放中置标志由循环消费；空闲则立即执行） */
+    /**
+     * [Seek] Worker 线程槽：空闲时立即执行；播放中则转 requestSeek 标志
+     * （播放中 Queued 槽可能迟迟进不来，故门面层对 isRunning 走 requestSeek）
+     */
     void applySeek(qint64 ms)
     {
         QMutexLocker lock(&m_mutex);
@@ -402,6 +436,7 @@ public slots:
         }
     }
 
+    /** [控制] 析构前：中止循环并关闭文件 */
     void shutdown()
     {
         requestAbort();
@@ -412,15 +447,16 @@ public slots:
     }
 
 signals:
-    void frameReady(const QImage &frame, qint64 ptsMs);
-    void pcmReady(const QByteArray &pcm);
-    void audioReset();
+    void frameReady(const QImage &frame, qint64 ptsMs); ///< [画面] 一帧可显示图像
+    void pcmReady(const QByteArray &pcm);               ///< [音频] 一段重采样后的 PCM
+    void audioReset();                                  ///< [音频] Seek/停止时清空音频缓冲
     void positionChanged(qint64 positionMs);
     void stateChanged(FFmpegPlayer::State state);
     void errorOccurred(const QString &message);
     void playbackFinished();
 
 private:
+    /** [解析] 为指定流创建并打开解码器（视频或音频） */
     bool openCodec(int streamIndex, AVCodecContext **ctxOut)
     {
         AVStream *st = m_fmt->streams[streamIndex];
@@ -452,6 +488,7 @@ private:
         return true;
     }
 
+    /** [解析] 根据已打开的 AVFormatContext 填充 MediaInfo（时长、码率、各流） */
     void buildInfo(const QString &path)
     {
         m_info = MediaInfo{};
@@ -473,8 +510,8 @@ private:
     }
 
     /**
-     * 用“真实音频帧”初始化/重建 swr。
-     * 这是有声音的关键一步：不能再用可能为 NONE 的 codecCtx->sample_fmt。
+     * [音频] 用“真实音频帧”初始化/重建 swr（重采样到设备格式）
+     * 有声音的关键一步：不能用可能为 NONE 的 codecCtx->sample_fmt。
      */
     bool ensureSwrFromFrame(const AVFrame *frame)
     {
@@ -528,6 +565,10 @@ private:
         return true;
     }
 
+    /**
+     * [Seek] 真正执行跳转（调用方须已持有 m_mutex）
+     * avformat_seek_file / av_seek_frame + flush 解码器/重采样，并重置时钟
+     */
     void performSeek_l(qint64 targetMs)
     {
         const qint64 ts = av_rescale_q(targetMs, AVRational{1, 1000}, AVRational{1, AV_TIME_BASE});
@@ -560,6 +601,10 @@ private:
         emit positionChanged(targetMs);
     }
 
+    /**
+     * [时钟] 用帧 PTS 更新媒体时钟，并在漂移过大时重锚墙钟
+     * 同时发出 positionChanged 供 UI 刷新进度
+     */
     void updateClock(qint64 mediaPtsMs)
     {
         if (mediaPtsMs < 0) {
@@ -583,6 +628,7 @@ private:
         emit positionChanged(mediaPtsMs);
     }
 
+    /** [画面] 将解码后的 AVFrame 通过 swscale 转为 QImage(RGB32) */
     QImage convertVideoFrame(AVFrame *frame)
     {
         if (!frame || frame->width <= 0 || frame->height <= 0) {
@@ -610,6 +656,7 @@ private:
     }
 
     /**
+     * [时钟] 按媒体时钟等待到帧应显示的 PTS
      * @return true = 发生了 seek/abort，调用方应丢弃当前帧，不要 updateClock/显示
      */
     bool waitForPts(qint64 ptsMs)
@@ -639,6 +686,10 @@ private:
         return true;
     }
 
+    /**
+     * [控制] 在 demux/等待循环中消费暂停与 Seek 请求
+     * @return true 表示应 abort 退出循环
+     */
     bool consumeCommands()
     {
         QMutexLocker lock(&m_mutex);
@@ -657,6 +708,10 @@ private:
         return m_abort.load();
     }
 
+    /**
+     * [画面] 解码一个视频 packet：收帧 → 按 PTS 等待 → 转 RGB → frameReady
+     * @return 是否结束本 packet 的处理（含 abort/seek 打断）
+     */
     bool decodeVideo(AVPacket *pkt)
     {
         int ret = avcodec_send_packet(m_vdec, pkt);
@@ -705,6 +760,10 @@ private:
         return true;
     }
 
+    /**
+     * [音频] 解码一个音频 packet：收帧 → 懒加载 swr → 重采样 → pcmReady
+     * 纯音频文件时还会驱动时钟（waitForPts + updateClock）
+     */
     bool decodeAudio(AVPacket *pkt)
     {
         int ret = avcodec_send_packet(m_adec, pkt);
@@ -766,6 +825,10 @@ private:
         return true;
     }
 
+    /**
+     * [解复用] 播放主循环：读包 → 分发到 decodeVideo / decodeAudio
+     * EOF 后冲刷视频解码器残帧，然后退出
+     */
     void runLoop()
     {
         while (!m_abort.load()) {
@@ -898,6 +961,7 @@ public:
     int outChannels = 2;
 };
 
+/** [音频] 停止并销毁主线程 QAudioSink，清空 PCM 队列 */
 static void stopAudioDevice(FFmpegPlayerPrivate *d)
 {
     if (d->audioPump) {
@@ -912,6 +976,7 @@ static void stopAudioDevice(FFmpegPlayerPrivate *d)
     d->audioIo = nullptr;
 }
 
+/** [音频] 在主线程按设备格式打开 QAudioSink（Int16 / 立体声） */
 static bool startAudioDevice(FFmpegPlayerPrivate *d, QObject *parent)
 {
     stopAudioDevice(d);
@@ -958,6 +1023,7 @@ static bool startAudioDevice(FFmpegPlayerPrivate *d, QObject *parent)
     return true;
 }
 
+/** [音频] 定时从 PCM 队列泵数据到 QAudioSink */
 static void pumpAudio(FFmpegPlayerPrivate *d)
 {
     if (!d->sink || !d->audioIo) {
@@ -981,6 +1047,7 @@ FFmpegPlayer::FFmpegPlayer(QObject *parent)
     : QObject(parent)
     , d(new FFmpegPlayerPrivate)
 {
+    // 构造：创建解码线程 Worker，并桥接信号到本门面 / 主线程音频
     d->worker = new PlayerWorker;
     d->worker->moveToThread(&d->thread);
 
@@ -1044,6 +1111,7 @@ FFmpegPlayer::FFmpegPlayer(QObject *parent)
 
 FFmpegPlayer::~FFmpegPlayer()
 {
+    // 析构：中止解码循环、关闭文件、停音频、退出 Worker 线程
     d->worker->requestAbort();
     QMetaObject::invokeMethod(d->worker, "shutdown", Qt::BlockingQueuedConnection);
     stopAudioDevice(d);
@@ -1055,6 +1123,7 @@ FFmpegPlayer::~FFmpegPlayer()
     d = nullptr;
 }
 
+/** [门面] 打开文件：转发到 Worker.openFile（解析容器/流/解码器） */
 bool FFmpegPlayer::open(const QString &filePath)
 {
     if (d->state == State::Playing || d->state == State::Paused || d->worker->isRunning()) {
@@ -1084,6 +1153,7 @@ bool FFmpegPlayer::open(const QString &filePath)
     return true;
 }
 
+/** [门面] 关闭文件并释放解码资源 */
 void FFmpegPlayer::close()
 {
     stop();
@@ -1099,6 +1169,7 @@ bool FFmpegPlayer::isOpen() const
     return d->opened;
 }
 
+/** [门面] 播放：主线程开音频设备，再启动 Worker demux 循环 */
 void FFmpegPlayer::play()
 {
     if (!d->opened) {
@@ -1125,6 +1196,7 @@ void FFmpegPlayer::play()
     QMetaObject::invokeMethod(d->worker, "startPlayback", Qt::QueuedConnection);
 }
 
+/** [门面] 暂停 */
 void FFmpegPlayer::pause()
 {
     if (d->state != State::Playing) {
@@ -1133,6 +1205,7 @@ void FFmpegPlayer::pause()
     d->worker->requestPause();
 }
 
+/** [门面] 停止并回到起点 */
 void FFmpegPlayer::stop()
 {
     if (!d->opened) {
@@ -1147,6 +1220,11 @@ void FFmpegPlayer::stop()
     d->positionMs.store(0);
 }
 
+/**
+ * [门面] Seek
+ * 播放中 Worker 卡在 runLoop 时 Queued 槽进不去，故 isRunning 时走 requestSeek 标志；
+ * 空闲时投递 applySeek。seekingToMs 用于过滤 seek 完成前的过期 positionChanged。
+ */
 void FFmpegPlayer::seek(qint64 positionMs)
 {
     if (!d->opened) {

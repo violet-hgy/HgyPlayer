@@ -1,5 +1,4 @@
 #include "mainwindow.h"
-#include "FFmpegVideoParser.h"
 
 #include <QFileDialog>
 #include <QHBoxLayout>
@@ -68,6 +67,7 @@ MainWindow::MainWindow(QWidget *parent)
     connect(m_seekSlider, &QSlider::sliderReleased, this, &MainWindow::onSeekReleased);
     connect(m_seekSlider, &QSlider::valueChanged, this, &MainWindow::onSeekMoved);
 
+    // UI 只订阅播放器信号，不介入 demux/解码/时钟
     connect(m_player, &FFmpegPlayer::frameReady, this, &MainWindow::onFrameReady);
     connect(m_player, &FFmpegPlayer::positionChanged, this, &MainWindow::onPositionChanged);
     connect(m_player, &FFmpegPlayer::stateChanged, this, &MainWindow::onStateChanged);
@@ -90,29 +90,20 @@ void MainWindow::onOpen()
 
     m_player->stop();
 
-    m_pendingSeekMs = -1;
-
-    // 先用 Parser 展示详细流信息（可选，和播放器解耦）
-    FFmpegVideoParser parser;
-    if (parser.open(path)) {
-        showMediaSummary(parser.mediaInfo());
-        parser.close();
-    }
-
+    // 打开/解析媒体信息全部由播放器完成
     if (!m_player->open(path)) {
         QMessageBox::warning(this, QStringLiteral("打开失败"), m_player->lastError());
-        m_playBtn->setEnabled(false);
-        m_stopBtn->setEnabled(false);
-        m_seekSlider->setEnabled(false);
+        setTransportEnabled(false);
         return;
     }
+
+    showMediaSummary(m_player->mediaInfo());
 
     const qint64 duration = qMax<qint64>(0, m_player->durationMs());
     m_seekSlider->setRange(0, static_cast<int>(qMin(duration, static_cast<qint64>(INT_MAX))));
     m_seekSlider->setValue(0);
     m_seekSlider->setEnabled(duration > 0);
-    m_playBtn->setEnabled(true);
-    m_stopBtn->setEnabled(true);
+    setTransportEnabled(true);
     m_playBtn->setText(QStringLiteral("播放"));
     m_videoLabel->setText(QStringLiteral("已加载，点击播放"));
     updateTimeLabel();
@@ -132,7 +123,6 @@ void MainWindow::onPlayPause()
 
 void MainWindow::onStop()
 {
-    m_pendingSeekMs = -1;
     m_player->stop();
     m_seekSlider->setValue(0);
     updateTimeLabel();
@@ -150,20 +140,17 @@ void MainWindow::onSeekReleased()
         return;
     }
 
-    // 松手后先进入“等待 seek 生效”状态，避免旧的 positionChanged 把进度条拉回去
-    m_pendingSeekMs = m_seekSlider->value();
     m_sliderPressed = false;
-    m_player->seek(m_pendingSeekMs);
+    m_player->seek(m_seekSlider->value());
     updateTimeLabel();
 }
 
 void MainWindow::onSeekMoved(int value)
 {
     if (m_sliderPressed) {
-        // 拖动时只更新时间文字，松手再真正 seek
-        const qint64 duration = m_player->durationMs();
+        // 拖动中只预览时间文字，松手后再真正 seek
         m_timeLabel->setText(QStringLiteral("%1 / %2")
-                                 .arg(formatTime(value), formatTime(duration)));
+                                 .arg(formatTime(value), formatTime(m_player->durationMs())));
     }
 }
 
@@ -178,14 +165,7 @@ void MainWindow::onFrameReady(const QImage &frame, qint64)
 
 void MainWindow::onPositionChanged(qint64 ms)
 {
-    // seek 尚未对齐到目标时，丢掉过期进度，保持滑块在用户松手位置
-    if (m_pendingSeekMs >= 0) {
-        if (qAbs(ms - m_pendingSeekMs) > 900) {
-            return;
-        }
-        m_pendingSeekMs = -1;
-    }
-
+    // seek 过期进度过滤已在 FFmpegPlayer 内部完成，此处只刷新 UI
     if (!m_sliderPressed && m_seekSlider->isEnabled()) {
         m_seekSlider->blockSignals(true);
         const qint64 maxPos = m_seekSlider->maximum();
@@ -250,14 +230,18 @@ void MainWindow::showMediaSummary(const MediaInfo &info)
 
 void MainWindow::updateTimeLabel()
 {
-    qint64 pos = m_player->positionMs();
-    if (m_sliderPressed) {
-        pos = m_seekSlider->value();
-    } else if (m_pendingSeekMs >= 0) {
-        pos = m_pendingSeekMs;
-    }
+    const qint64 pos = m_sliderPressed ? m_seekSlider->value() : m_player->positionMs();
     m_timeLabel->setText(QStringLiteral("%1 / %2")
                              .arg(formatTime(pos), formatTime(m_player->durationMs())));
+}
+
+void MainWindow::setTransportEnabled(bool enabled)
+{
+    m_playBtn->setEnabled(enabled);
+    m_stopBtn->setEnabled(enabled);
+    if (!enabled) {
+        m_seekSlider->setEnabled(false);
+    }
 }
 
 QString MainWindow::formatTime(qint64 ms)
