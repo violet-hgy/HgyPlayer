@@ -17,11 +17,13 @@ find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Widgets Multimedia)
 
 # ---------------------------------------------------------------------------
 # FFmpeg（BtbN win64 lgpl-shared，已放在工程目录下）
+# 仓库保留完整共享包，便于他人克隆后直接编译、版本一致。
 # 目录结构约定：
 #   ffmpeg-master-latest-win64-lgpl-shared/
 #     include/   头文件
 #     lib/       导入库（MinGW: *.dll.a，MSVC: *.lib）
-#     bin/       运行时 DLL
+#     bin/       完整运行时（含 DLL / exe / 未使用的 avfilter、avdevice 等）
+# 本工程仅以库方式调用（libav* / libsw* API），不启动命令行工具。
 # ---------------------------------------------------------------------------
 set(FFMPEG_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/ffmpeg-master-latest-win64-lgpl-shared")
 
@@ -95,13 +97,47 @@ target_link_libraries(HgyPlayer PRIVATE
     Qt${QT_VERSION_MAJOR}::Multimedia
 )
 
-# Windows 下把 FFmpeg DLL 复制到可执行文件同目录，避免运行时找不到动态库
+# ---------------------------------------------------------------------------
+# Windows 运行目录：最小可用 DLL 拷贝（仓库 bin/ 仍保留完整包，不在此删文件）
+#
+# 与上方 target_link_libraries 保持一致，只拷贝实际链接到的库对应 DLL：
+#   avutil / avcodec / avformat / swscale / swresample
+# 依赖关系自洽：avformat→avcodec→avutil/swresample，swscale→avutil
+#
+# 明确不拷贝（运行本播放器不需要）：
+#   - ffmpeg.exe / ffplay.exe / ffprobe.exe（命令行工具）
+#   - avfilter-*.dll / avdevice-*.dll（未链接，且不被上述 DLL 反向依赖）
+#
+# 通配版本号（如 avcodec-63.dll），升级 FFmpeg 共享包后一般无需改此处。
+# ---------------------------------------------------------------------------
 if(WIN32)
+    set(_ffmpeg_runtime_dll_globs
+        avutil-*.dll
+        avcodec-*.dll
+        avformat-*.dll
+        swscale-*.dll
+        swresample-*.dll
+    )
+    set(FFMPEG_RUNTIME_DLLS "")
+    foreach(_pat IN LISTS _ffmpeg_runtime_dll_globs)
+        file(GLOB _matched CONFIGURE_DEPENDS "${FFMPEG_ROOT}/bin/${_pat}")
+        list(APPEND FFMPEG_RUNTIME_DLLS ${_matched})
+    endforeach()
+    if(NOT FFMPEG_RUNTIME_DLLS)
+        message(FATAL_ERROR "No FFmpeg runtime DLLs found under: ${FFMPEG_ROOT}/bin")
+    endif()
+
+    set(_ffmpeg_copy_cmds "")
+    foreach(_dll IN LISTS FFMPEG_RUNTIME_DLLS)
+        list(APPEND _ffmpeg_copy_cmds
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${_dll}"
+                "$<TARGET_FILE_DIR:HgyPlayer>"
+        )
+    endforeach()
     add_custom_command(TARGET HgyPlayer POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_directory
-            "${FFMPEG_ROOT}/bin"
-            "$<TARGET_FILE_DIR:HgyPlayer>"
-        COMMENT "Copy FFmpeg runtime DLLs next to HgyPlayer"
+        ${_ffmpeg_copy_cmds}
+        COMMENT "Copy minimal FFmpeg runtime DLLs next to HgyPlayer"
     )
 endif()
 
