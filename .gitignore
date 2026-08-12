@@ -59,11 +59,7 @@ ui_*.h
 *.idb
 *.map
 
-# ----- 本机 FFmpeg 二进制包（体积大，请本地放置） -----
-# 目录名保持与 CMakeLists.txt 中 FFMPEG_ROOT 一致
-ffmpeg-master-latest-win64-lgpl-shared/
-ffmpeg-*-win64-*/
-ffmpeg-*-shared/
+# ----- 压缩包（源码仓库不提交安装包压缩文件） -----
 *.7z
 *.zip
 !doc/**
@@ -81,3 +77,9 @@ Desktop.ini
 .qtc_clangd/
 .cache/
 *.user.*
+
+# ----- 强制纳入 vendored FFmpeg（覆盖上方 *.dll/*.lib/*.exe/*.a 等规则） -----
+# 目录名需与 CMakeLists.txt 中 FFMPEG_ROOT 一致，便于他人克隆后直接编译
+!ffmpeg-master-latest-win64-lgpl-shared/
+!ffmpeg-master-latest-win64-lgpl-shared/**/
+!ffmpeg-master-latest-win64-lgpl-shared/**
