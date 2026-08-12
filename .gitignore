@@ -1,0 +1,83 @@
+# =============================================================================
+# HgyPlayer .gitignore
+# =============================================================================
+
+# ----- Qt Creator / IDE -----
+CMakeLists.txt.user
+CMakeLists.txt.user.*
+*.pro.user
+*.pro.user.*
+*.qbs.user
+*.qbs.user.*
+*.autosave
+*.qmlproject.user
+*.qmlproject.user.*
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ----- CMake / 构建产物 -----
+build/
+cmake-build-*/
+out/
+install/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+CTestTestfile.cmake
+_deps/
+Testing/
+.ninja_deps
+.ninja_log
+build.ninja
+*.ninja
+
+# ----- Qt 自动生成 -----
+*_autogen/
+moc_*.cpp
+moc_*.h
+qrc_*.cpp
+ui_*.h
+*.moc
+
+# ----- 编译产物 -----
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.pdb
+*.ilk
+*.exp
+*.idb
+*.map
+
+# ----- 本机 FFmpeg 二进制包（体积大，请本地放置） -----
+# 目录名保持与 CMakeLists.txt 中 FFMPEG_ROOT 一致
+ffmpeg-master-latest-win64-lgpl-shared/
+ffmpeg-*-win64-*/
+ffmpeg-*-shared/
+*.7z
+*.zip
+!doc/**
+
+# ----- 系统 / 杂项 -----
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.log
+*.tmp
+*.bak
+*.orig
+
+# ----- 调试 / 分析 -----
+.qtc_clangd/
+.cache/
+*.user.*
