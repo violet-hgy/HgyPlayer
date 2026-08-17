@@ -1,4 +1,6 @@
 #include "FFmpegPlayer.h"
+#include "GpuVideoFrame.h"
+#include "render/D3D11SharedDevice.h"
 
 /**
  * @file FFmpegPlayer.cpp
@@ -22,6 +24,11 @@
  * 重采样为什么要“首帧懒加载”：
  * - 打开文件时 codec 的 sample_fmt / ch_layout 可能仍是 NONE
  * - 必须等第一帧 AVFrame 才能正确初始化 swr，否则会静默关掉音频
+ *
+ * FFmpeg API 注释约定（学习用）：
+ *   [来源库] 函数名：作用。
+ *   形参：a=...；b=...。返回：...
+ * 来源库：libavformat / libavcodec / libavutil / libswscale / libswresample
  */
 
 #include <QAudioDevice>
@@ -39,21 +46,27 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <memory>
 
 extern "C" {
-#include <libavcodec/avcodec.h>
-#include <libavformat/avformat.h>
-#include <libavutil/channel_layout.h>
-#include <libavutil/error.h>
-#include <libavutil/frame.h>
+#include <libavcodec/avcodec.h>       // 解码器
+#include <libavformat/avformat.h>     // 容器 / demux
+#include <libavutil/channel_layout.h> // 声道布局
+#include <libavutil/error.h>          // av_strerror
+#include <libavutil/frame.h>          // AVFrame
+#include <libavutil/hwcontext.h>      // 硬解设备缓冲
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
-#include <libavutil/pixdesc.h>
-#include <libavutil/rational.h>
-#include <libavutil/samplefmt.h>
-#include <libswresample/swresample.h>
-#include <libswscale/swscale.h>
+#include <libavutil/pixdesc.h>        // 像素格式名
+#include <libavutil/rational.h>       // AVRational / av_rescale_q
+#include <libavutil/samplefmt.h>      // 采样格式名
+#include <libswresample/swresample.h> // 音频重采样
+#include <libswscale/swscale.h>       // 图像缩放 / 像素转换
 }
+
+#ifdef Q_OS_WIN
+#include <libavutil/hwcontext_d3d11va.h>
+#endif
 
 namespace {
 
@@ -61,6 +74,8 @@ namespace {
 QString avErr(int err)
 {
     char buf[AV_ERROR_MAX_STRING_SIZE] = {0};
+    // [libavutil] av_strerror：把负错误码写成英文短句。
+    // 形参：errnum=FFmpeg 返回值（通常 <0）；errbuf=输出缓冲；errbuf_size=缓冲字节数。
     av_strerror(err, buf, sizeof(buf));
     return QString::fromUtf8(buf);
 }
@@ -71,6 +86,8 @@ qint64 tsToMs(qint64 ts, AVRational tb)
     if (ts == AV_NOPTS_VALUE) {
         return -1;
     }
+    // [libavutil] av_rescale_q：按有理数换时间基，避免浮点误差。
+    // 形参：a=时间戳；bq=源时间基（流的 time_base）；cq=目标时间基（这里是 1/1000 秒）。
     return av_rescale_q(ts, tb, AVRational{1, 1000});
 }
 
@@ -93,6 +110,8 @@ MediaStreamInfo makeStreamInfo(AVFormatContext *fmt, int index)
     default: info.mediaType = QStringLiteral("unknown"); break;
     }
 
+    // [libavcodec] avcodec_find_decoder：按 codec_id 找软解实现（h264/aac 等）。
+    // 形参：id=流里记录的编码器 ID。返回：解码器描述，找不到为 nullptr。
     if (const AVCodec *c = avcodec_find_decoder(par->codec_id)) {
         info.codecName = QString::fromUtf8(c->name ? c->name : "");
         info.codecLongName = QString::fromUtf8(c->long_name ? c->long_name : "");
@@ -106,14 +125,20 @@ MediaStreamInfo makeStreamInfo(AVFormatContext *fmt, int index)
         info.width = par->width;
         info.height = par->height;
         if (st->avg_frame_rate.den) {
+            // [libavutil] av_q2d：AVRational → double（这里把帧率分数换成 fps）。
+            // 形参：a=分子/分母有理数。
             info.frameRate = av_q2d(st->avg_frame_rate);
         }
+        // [libavutil] av_get_pix_fmt_name：像素格式枚举 → "yuv420p" 这类名字。
+        // 形参：pix_fmt=AVPixelFormat。
         if (const char *pix = av_get_pix_fmt_name(static_cast<AVPixelFormat>(par->format))) {
             info.pixelFormat = QString::fromUtf8(pix);
         }
     } else if (par->codec_type == AVMEDIA_TYPE_AUDIO) {
         info.sampleRate = par->sample_rate;
         info.channels = par->ch_layout.nb_channels;
+        // [libavutil] av_get_sample_fmt_name：采样格式枚举 → "fltp" 等。
+        // 形参：sample_fmt=AVSampleFormat。
         if (const char *sf = av_get_sample_fmt_name(static_cast<AVSampleFormat>(par->format))) {
             info.sampleFormat = QString::fromUtf8(sf);
         }
@@ -196,6 +221,8 @@ public:
         m_outChannels = channels > 0 ? channels : 2;
         // 输出格式变化后，强制下一帧重建 swr
         if (m_swr) {
+            // [libswresample] swr_free：释放重采样上下文并把指针置空。
+            // 形参：s=SwrContext**。
             swr_free(&m_swr);
         }
     }
@@ -261,6 +288,12 @@ public:
     qint64 positionMs() const { return m_clockMs.load(); }
     bool isRunning() const { return m_running.load(); }
     bool hasAudio() const { return m_audioStream >= 0 && m_adec != nullptr; }
+    bool hardwareDecodeActive() const { return m_hwActive; }
+
+    void setD3D11Device(std::shared_ptr<D3D11SharedDevice> dev)
+    {
+        m_d3d = std::move(dev);
+    }
 
 public slots:
     /**
@@ -274,19 +307,30 @@ public slots:
 
         AVFormatContext *fmt = nullptr;
         const QByteArray pathBytes = path.toUtf8();
+        // [libavformat] avformat_open_input：打开文件、识别容器、创建 AVFormatContext。
+        // 形参：ps=输出上下文；url=路径；fmt=强制输入格式(nullptr=自动探测)；
+        //       options=打开选项字典(nullptr=无)。返回：0 成功，<0 失败。
         int ret = avformat_open_input(&fmt, pathBytes.constData(), nullptr, nullptr);
         if (ret < 0) {
             m_lastError = QStringLiteral("open_input: %1").arg(avErr(ret));
             return false;
         }
+        // [libavformat] avformat_find_stream_info：读一段数据，填各流 codecpar/时长/帧率。
+        // 形参：ic=已打开的上下文；options=每流选项(nullptr=默认)。返回：>=0 成功。
         ret = avformat_find_stream_info(fmt, nullptr);
         if (ret < 0) {
+            // [libavformat] avformat_close_input：关文件并释放上下文，指针置空。
+            // 形参：s=AVFormatContext**。
             avformat_close_input(&fmt);
             m_lastError = QStringLiteral("find_stream_info: %1").arg(avErr(ret));
             return false;
         }
 
         m_fmt = fmt;
+        // [libavformat] av_find_best_stream：按启发式挑最适合播放的那条流。
+        // 形参：ic=上下文；type=VIDEO/AUDIO；wanted_stream_nb=-1 表示不指定；
+        //       related_stream=-1；decoder_ret=可选输出解码器；flags=0。
+        // 返回：流下标，失败为负错误码。
         m_videoStream = av_find_best_stream(m_fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
         m_audioStream = av_find_best_stream(m_fmt, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
         if (m_videoStream < 0 && m_audioStream < 0) {
@@ -308,6 +352,9 @@ public slots:
 
         buildInfo(path);
 
+        // [libavcodec] av_packet_alloc：分配空压缩包（后续 av_read_frame 填数据）。
+        // [libavutil] av_frame_alloc：分配空解码帧（后续 receive_frame 填像素/PCM）。
+        // 形参：无。返回：堆对象，失败 nullptr；释放用 av_packet_free / av_frame_free。
         m_packet = av_packet_alloc();
         m_vframe = av_frame_alloc();
         m_aframe = av_frame_alloc();
@@ -330,12 +377,16 @@ public slots:
             swr_free(&m_swr);
         }
         if (m_sws) {
+            // [libswscale] sws_freeContext：释放像素转换上下文。
+            // 形参：swsContext=SwsContext*（这里不是双重指针）。
             sws_freeContext(m_sws);
             m_sws = nullptr;
         }
+        // 下列 free 都接受 **，内部置空，传入 nullptr 也安全。
         av_frame_free(&m_vframe);
         av_frame_free(&m_aframe);
         av_packet_free(&m_packet);
+        // [libavcodec] avcodec_free_context：关解码器并释放 AVCodecContext。
         avcodec_free_context(&m_vdec);
         avcodec_free_context(&m_adec);
         if (m_fmt) {
@@ -351,6 +402,7 @@ public slots:
         m_paused = false;
         m_seekReq = false;
         m_discardUntilPtsMs = -1;
+        m_hwActive = false;
         emit audioReset();
     }
 
@@ -448,6 +500,7 @@ public slots:
 
 signals:
     void frameReady(const QImage &frame, qint64 ptsMs); ///< [画面] 一帧可显示图像
+    void gpuFrameReady(GpuVideoFrame frame);            ///< [画面] D3D11 硬解 GPU 帧
     void pcmReady(const QByteArray &pcm);               ///< [音频] 一段重采样后的 PCM
     void audioReset();                                  ///< [音频] Seek/停止时清空音频缓冲
     void positionChanged(qint64 positionMs);
@@ -460,32 +513,75 @@ private:
     bool openCodec(int streamIndex, AVCodecContext **ctxOut)
     {
         AVStream *st = m_fmt->streams[streamIndex];
+        // [libavcodec] avcodec_find_decoder：按流的 codec_id 找解码器。
+        // 形参：id=AVCodecID。返回：解码器，找不到 nullptr。
         const AVCodec *dec = avcodec_find_decoder(st->codecpar->codec_id);
         if (!dec) {
             m_lastError = QStringLiteral("decoder not found");
             return false;
         }
+        // [libavcodec] avcodec_alloc_context3：为该解码器分配运行上下文。
+        // 形参：codec=解码器（可 nullptr，这里传入以便填默认值）。
         AVCodecContext *ctx = avcodec_alloc_context3(dec);
         if (!ctx) {
             m_lastError = QStringLiteral("alloc codec ctx failed");
             return false;
         }
+        // [libavcodec] avcodec_parameters_to_context：把容器里的 codecpar 拷进解码器。
+        // 形参：codec=目标上下文；par=流参数（宽高、采样率、extradata 等）。
         int ret = avcodec_parameters_to_context(ctx, st->codecpar);
         if (ret < 0) {
             avcodec_free_context(&ctx);
             m_lastError = QStringLiteral("parameters_to_context: %1").arg(avErr(ret));
             return false;
         }
-        // 略增解码线程，降低卡顿（可选）
-        ctx->thread_count = 2;
+
+        m_hwActive = false;
+        const bool tryHw = m_d3d && st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO;
+        if (tryHw) {
+            AVBufferRef *hwRef = m_d3d->refHwDeviceCtx();
+            if (hwRef) {
+                ctx->hw_device_ctx = hwRef;
+                // get_format：解码器问“你要哪种像素格式”；我们选 AV_PIX_FMT_D3D11。
+                ctx->get_format = &PlayerWorker::hwGetFormat;
+                ctx->thread_count = 1;      // 硬解必须单线程
+                ctx->extra_hw_frames = 16;  // 额外 GPU 表面，避免显示还在用时解码器没表面
+            }
+        } else {
+            ctx->thread_count = 2;
+        }
+
+        // [libavcodec] avcodec_open2：真正打开解码器（分配内部缓冲、校验参数）。
+        // 形参：avctx=上下文；codec=解码器；options=打开选项(nullptr=默认)。
+        // 返回：0 成功。硬解失败时下面会清 hw_device_ctx 再开一次软解。
         ret = avcodec_open2(ctx, dec, nullptr);
+        if (ret < 0 && tryHw && ctx->hw_device_ctx) {
+            // [libavutil] av_buffer_unref：引用计数 -1，到 0 时释放硬解设备。
+            // 形参：buf=AVBufferRef**。
+            av_buffer_unref(&ctx->hw_device_ctx);
+            ctx->get_format = nullptr;
+            ctx->thread_count = 2;
+            emit errorOccurred(QStringLiteral("D3D11VA 硬解打开失败，回退软解: %1").arg(avErr(ret)));
+            ret = avcodec_open2(ctx, dec, nullptr);
+        }
         if (ret < 0) {
             avcodec_free_context(&ctx);
             m_lastError = QStringLiteral("codec_open2: %1").arg(avErr(ret));
             return false;
         }
+        m_hwActive = ctx->hw_device_ctx != nullptr;
         *ctxOut = ctx;
         return true;
+    }
+
+    static AVPixelFormat hwGetFormat(AVCodecContext *, const AVPixelFormat *pix_fmts)
+    {
+        for (const AVPixelFormat *p = pix_fmts; *p != AV_PIX_FMT_NONE; ++p) {
+            if (*p == AV_PIX_FMT_D3D11) {
+                return AV_PIX_FMT_D3D11;
+            }
+        }
+        return AV_PIX_FMT_NONE;
     }
 
     /** [解析] 根据已打开的 AVFormatContext 填充 MediaInfo（时长、码率、各流） */
@@ -536,8 +632,13 @@ private:
         }
 
         AVChannelLayout outLayout;
+        // [libavutil] av_channel_layout_default：按声道数填默认布局（2 → stereo）。
+        // 形参：ch_layout=输出布局；nb_channels=声道数。
         av_channel_layout_default(&outLayout, m_outChannels);
 
+        // [libswresample] swr_alloc_set_opts2：按输入/输出规格创建重采样器。
+        // 形参：ps=输出 SwrContext**；out_ch_layout/out_sample_fmt/out_sample_rate=设备侧；
+        //       in_ch_layout/in_sample_fmt/in_sample_rate=解码帧侧；log_offset/log_ctx=日志。
         int ret = swr_alloc_set_opts2(&m_swr,
                                       &outLayout,
                                       AV_SAMPLE_FMT_S16,
@@ -547,11 +648,14 @@ private:
                                       inRate,
                                       0,
                                       nullptr);
+        // [libavutil] av_channel_layout_uninit：释放布局内部堆（与 default 配对）。
         av_channel_layout_uninit(&outLayout);
         if (ret < 0 || !m_swr) {
             emit errorOccurred(QStringLiteral("swr_alloc failed"));
             return false;
         }
+        // [libswresample] swr_init：按上面规格初始化，失败则不能 convert。
+        // 形参：s=SwrContext*。返回：0 成功。
         ret = swr_init(m_swr);
         if (ret < 0) {
             swr_free(&m_swr);
@@ -571,9 +675,15 @@ private:
      */
     void performSeek_l(qint64 targetMs)
     {
+        // [libavutil] av_rescale_q：毫秒(1/1000) → AV_TIME_BASE(1/1000000)，供容器 seek。
         const qint64 ts = av_rescale_q(targetMs, AVRational{1, 1000}, AVRational{1, AV_TIME_BASE});
+        // [libavformat] avformat_seek_file：把 demux 指针跳到目标时间附近的关键帧。
+        // 形参：s=上下文；stream_index=-1 表示用 AV_TIME_BASE；
+        //       min_ts/ts/max_ts=可接受时间范围；flags=0。
         int ret = avformat_seek_file(m_fmt, -1, INT64_MIN, ts, INT64_MAX, 0);
         if (ret < 0) {
+            // [libavformat] av_seek_frame：旧式 seek。flags=AVSEEK_FLAG_BACKWARD 表示往前回关键帧。
+            // 形参：s；stream_index=-1；timestamp=目标；flags。
             ret = av_seek_frame(m_fmt, -1, ts, AVSEEK_FLAG_BACKWARD);
         }
         if (ret < 0) {
@@ -581,6 +691,8 @@ private:
             return;
         }
         if (m_vdec) {
+            // [libavcodec] avcodec_flush_buffers：丢掉解码器内部已解/半解的帧（seek 后必须）。
+            // 形参：avctx=解码器上下文。
             avcodec_flush_buffers(m_vdec);
         }
         if (m_adec) {
@@ -588,6 +700,7 @@ private:
         }
         // seek 后重采样残留丢弃
         if (m_swr) {
+            // [libswresample] swr_convert：这里 in/out 都空，只冲掉内部 delay 缓冲。
             swr_convert(m_swr, nullptr, 0, nullptr, 0);
         }
         m_eof = false;
@@ -628,31 +741,87 @@ private:
         emit positionChanged(mediaPtsMs);
     }
 
-    /** [画面] 将解码后的 AVFrame 通过 swscale 转为 QImage(RGB32) */
+    /** [画面] 将解码后的 AVFrame 通过 swscale 转为 QImage(ARGB32/BGRA) */
     QImage convertVideoFrame(AVFrame *frame)
     {
         if (!frame || frame->width <= 0 || frame->height <= 0) {
             return {};
         }
+
+        AVFrame *transferred = nullptr;
+        const AVFrame *src = frame;
+        if (frame->format == AV_PIX_FMT_D3D11) {
+            transferred = av_frame_alloc();
+            // [libavutil] av_hwframe_transfer_data：把 GPU 表面拷到 CPU 帧（硬解失败回退时用）。
+            // 形参：dst=CPU 帧；src=D3D11 帧；flags=0。返回：0 成功。
+            if (!transferred || av_hwframe_transfer_data(transferred, frame, 0) < 0) {
+                av_frame_free(&transferred);
+                return {};
+            }
+            src = transferred;
+        }
+
+        const AVPixelFormat srcFmt = static_cast<AVPixelFormat>(src->format);
+        if (srcFmt == AV_PIX_FMT_NONE) {
+            av_frame_free(&transferred);
+            return {};
+        }
+
+        // [libswscale] sws_getCachedContext：按宽高/格式取（或重建）转换器，可复用上次的。
+        // 形参：context=旧上下文(可 nullptr)；srcW/H/format=源；dstW/H/format=目标 BGRA；
+        //       flags=算法(SWS_BILINEAR)；srcFilter/dstFilter/param=滤镜，这里全空。
         m_sws = sws_getCachedContext(m_sws,
-                                     frame->width,
-                                     frame->height,
-                                     static_cast<AVPixelFormat>(frame->format),
-                                     frame->width,
-                                     frame->height,
-                                     AV_PIX_FMT_RGB32,
+                                     src->width,
+                                     src->height,
+                                     srcFmt,
+                                     src->width,
+                                     src->height,
+                                     AV_PIX_FMT_BGRA,
                                      SWS_BILINEAR,
                                      nullptr,
                                      nullptr,
                                      nullptr);
         if (!m_sws) {
+            av_frame_free(&transferred);
             return {};
         }
-        QImage img(frame->width, frame->height, QImage::Format_RGB32);
+        QImage img(src->width, src->height, QImage::Format_ARGB32);
+        if (img.isNull()) {
+            av_frame_free(&transferred);
+            return {};
+        }
         uint8_t *dst[4] = {img.bits(), nullptr, nullptr, nullptr};
         int dstStride[4] = {static_cast<int>(img.bytesPerLine()), 0, 0, 0};
-        sws_scale(m_sws, frame->data, frame->linesize, 0, frame->height, dst, dstStride);
+        // [libswscale] sws_scale：把 src 像素写进 dst（这里写 QImage 的 bits）。
+        // 形参：c=上下文；srcSlice/srcStride=源平面；srcSliceY=起始行；srcSliceH=行数；
+        //       dst/dstStride=目标平面。返回：输出高度。
+        sws_scale(m_sws, src->data, src->linesize, 0, src->height, dst, dstStride);
+        av_frame_free(&transferred);
         return img;
+    }
+
+    void outputVideoFrame(qint64 ptsMs)
+    {
+#ifdef Q_OS_WIN
+        if (m_vframe->format == AV_PIX_FMT_D3D11 && m_d3d) {
+            GpuVideoFrame gpu = m_d3d->convertDecoderFrame(m_vframe);
+            gpu.ptsMs = ptsMs;
+            if (gpu.isValid()) {
+                if (ptsMs >= 0) {
+                    updateClock(ptsMs);
+                }
+                emit gpuFrameReady(gpu);
+                return;
+            }
+        }
+#endif
+        const QImage image = convertVideoFrame(m_vframe);
+        if (!image.isNull()) {
+            if (ptsMs >= 0) {
+                updateClock(ptsMs);
+            }
+            emit frameReady(image, ptsMs);
+        }
     }
 
     /**
@@ -714,11 +883,17 @@ private:
      */
     bool decodeVideo(AVPacket *pkt)
     {
+        // [libavcodec] avcodec_send_packet：把一包压缩数据送进解码器。
+        // 形参：avctx=视频解码器；avpkt=压缩包（pkt=nullptr 表示 flush 尾帧）。
+        // 返回：0 成功；AVERROR(EAGAIN)=先 receive；其它负值为失败。
         int ret = avcodec_send_packet(m_vdec, pkt);
         if (ret < 0) {
             return true;
         }
         while (ret >= 0) {
+            // [libavcodec] avcodec_receive_frame：取出一帧已解码图像。
+            // 形参：avctx；frame=输出 AVFrame（硬解时 format=D3D11，data[0]=纹理）。
+            // 返回：0 有帧；EAGAIN=还要再 send；EOF=已冲完。
             ret = avcodec_receive_frame(m_vdec, m_vframe);
             if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
                 break;
@@ -735,6 +910,7 @@ private:
 
             // seek 后跳过目标点之前的帧（从关键键帧解码上来的）
             if (m_discardUntilPtsMs >= 0 && ptsMs >= 0 && ptsMs + 50 < m_discardUntilPtsMs) {
+                // [libavutil] av_frame_unref：丢掉本帧缓冲，AVFrame 结构可复用。
                 av_frame_unref(m_vframe);
                 continue;
             }
@@ -748,14 +924,8 @@ private:
                 return true;
             }
 
-            const QImage image = convertVideoFrame(m_vframe);
+            outputVideoFrame(ptsMs);
             av_frame_unref(m_vframe);
-            if (!image.isNull()) {
-                if (ptsMs >= 0) {
-                    updateClock(ptsMs);
-                }
-                emit frameReady(image, ptsMs);
-            }
         }
         return true;
     }
@@ -766,6 +936,7 @@ private:
      */
     bool decodeAudio(AVPacket *pkt)
     {
+        // send/receive 与视频相同，只是输出是 PCM 样本而不是图像。
         int ret = avcodec_send_packet(m_adec, pkt);
         if (ret < 0) {
             return true;
@@ -791,6 +962,9 @@ private:
             }
 
             const int srcRate = m_aframe->sample_rate > 0 ? m_aframe->sample_rate : m_swrInRate;
+            // [libswresample] swr_get_delay：重采样器里还积着多少输入采样。
+            // 形参：s=上下文；base=用输入采样率计数。
+            // [libavutil] av_rescale_rnd：按采样率换算输出缓冲需要多少样本（向上取整）。
             const int maxOut =
                 av_rescale_rnd(swr_get_delay(m_swr, srcRate) + m_aframe->nb_samples,
                                m_outSampleRate,
@@ -799,6 +973,9 @@ private:
             QByteArray pcm;
             pcm.resize(maxOut * m_outChannels * static_cast<int>(sizeof(int16_t)));
             uint8_t *outPtr = reinterpret_cast<uint8_t *>(pcm.data());
+            // [libswresample] swr_convert：输入帧 PCM → 设备格式 Int16 立体声。
+            // 形参：s；out/out_count=输出缓冲及最大样本数；in/in_count=输入平面及样本数。
+            // 返回：实际写出的输出样本数。
             const int outSamples = swr_convert(m_swr,
                                                &outPtr,
                                                maxOut,
@@ -841,6 +1018,7 @@ private:
 
             if (m_eof) {
                 if (m_vdec) {
+                    // [libavcodec] avcodec_send_packet(pkt=nullptr)：输入结束，把内部残留帧吐出。
                     avcodec_send_packet(m_vdec, nullptr);
                     for (;;) {
                         const int fr = avcodec_receive_frame(m_vdec, m_vframe);
@@ -862,14 +1040,8 @@ private:
                             av_frame_unref(m_vframe);
                             continue;
                         }
-                        const QImage image = convertVideoFrame(m_vframe);
+                        outputVideoFrame(ptsMs);
                         av_frame_unref(m_vframe);
-                        if (!image.isNull()) {
-                            if (ptsMs >= 0) {
-                                updateClock(ptsMs);
-                            }
-                            emit frameReady(image, ptsMs);
-                        }
                         if (m_abort.load()) {
                             break;
                         }
@@ -878,6 +1050,8 @@ private:
                 break;
             }
 
+            // [libavformat] av_read_frame：从容器读下一个压缩包（视频或音频交错）。
+            // 形参：s=上下文；pkt=输出包（须先 alloc）。返回：0 成功；AVERROR_EOF=文件结束。
             const int ret = av_read_frame(m_fmt, m_packet);
             if (ret == AVERROR_EOF) {
                 m_eof = true;
@@ -893,6 +1067,7 @@ private:
             } else if (m_packet->stream_index == m_audioStream && m_adec) {
                 decodeAudio(m_packet);
             }
+            // [libavcodec] av_packet_unref：释放本包数据，结构复用给下一轮 read。
             av_packet_unref(m_packet);
         }
     }
@@ -933,6 +1108,8 @@ private:
 
     MediaInfo m_info;
     QString m_lastError;
+    std::shared_ptr<D3D11SharedDevice> m_d3d;
+    bool m_hwActive = false;
 };
 
 // ============================================================================
@@ -1052,6 +1229,8 @@ FFmpegPlayer::FFmpegPlayer(QObject *parent)
     d->worker->moveToThread(&d->thread);
 
     connect(d->worker, &PlayerWorker::frameReady, this, &FFmpegPlayer::frameReady);
+    qRegisterMetaType<GpuVideoFrame>("GpuVideoFrame");
+    connect(d->worker, &PlayerWorker::gpuFrameReady, this, &FFmpegPlayer::gpuFrameReady);
     connect(d->worker, &PlayerWorker::positionChanged, this, [this](qint64 ms) {
         // seek 已发出但 Worker 尚未跳转完成时，忽略旧进度，防止 UI 回跳
         const qint64 pending = d->seekingToMs.load();
@@ -1167,6 +1346,21 @@ void FFmpegPlayer::close()
 bool FFmpegPlayer::isOpen() const
 {
     return d->opened;
+}
+
+void FFmpegPlayer::setD3D11SharedDevice(std::shared_ptr<D3D11SharedDevice> device)
+{
+    if (d->worker->isRunning()) {
+        stop();
+    }
+    QMetaObject::invokeMethod(d->worker, [this, device]() {
+        d->worker->setD3D11Device(device);
+    }, Qt::BlockingQueuedConnection);
+}
+
+bool FFmpegPlayer::hardwareDecodeActive() const
+{
+    return d->worker && d->worker->hardwareDecodeActive();
 }
 
 /** [门面] 播放：主线程开音频设备，再启动 Worker demux 循环 */

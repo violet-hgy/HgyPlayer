@@ -10,6 +10,8 @@
  *   [3] 容器层：打开文件 + find_stream_info
  *   [4] 元数据层：把 AV* 转成 MediaInfo
  *   [5] 解码层：抽首帧 + 像素格式转换
+ *
+ * FFmpeg API 注释：[来源库] 函数名：作用。下一行写形参。
  */
 
 extern "C" {
@@ -44,6 +46,8 @@ void FFmpegVideoParser::setError(const QString &message)
 QString FFmpegVideoParser::avErrorToString(int errnum)
 {
     char buf[AV_ERROR_MAX_STRING_SIZE] = {0};
+    // [libavutil] av_strerror：错误码 → 可读字符串。
+    // 形参：errnum=负错误码；errbuf/errbuf_size=输出缓冲。
     av_strerror(errnum, buf, sizeof(buf));
     return QString::fromUtf8(buf);
 }
@@ -100,7 +104,8 @@ void FFmpegVideoParser::close()
     closeVideoDecoder();
 
     if (m_formatCtx) {
-        // avformat_close_input 会释放 context 本身，并把指针置空
+        // [libavformat] avformat_close_input：关文件并释放上下文，指针置空。
+        // 形参：s=AVFormatContext**。
         avformat_close_input(&m_formatCtx);
         m_formatCtx = nullptr;
     }
@@ -116,21 +121,11 @@ void FFmpegVideoParser::close()
 
 bool FFmpegVideoParser::openContainer(const QString &filePath)
 {
-    /**
-     * avformat_open_input:
-     *   - 创建 AVFormatContext
-     *   - 根据后缀 / 文件头识别容器格式
-     *   - 打开 IO
-     *
-     * Windows + Qt 注意：
-     *   FFmpeg 期望的是本地 8-bit 路径或 UTF-8（取决于构建）。
-     *   这里用 QFile::encodeName / toLocal8Bit 更稳妥；
-     *   Qt6 下 toLocal8Bit 通常足够。若路径含特殊字符失败，
-     *   可改为 toUtf8() 再试。
-     */
     const QByteArray pathBytes = filePath.toUtf8();
 
     AVFormatContext *fmt = nullptr;
+    // [libavformat] avformat_open_input：打开文件、识别容器、创建 AVFormatContext。
+    // 形参：ps=输出上下文；url=路径；fmt=强制格式(nullptr=探测)；options=打开选项。
     const int openRet = avformat_open_input(&fmt, pathBytes.constData(), nullptr, nullptr);
     if (openRet < 0) {
         setError(QStringLiteral("avformat_open_input failed: %1").arg(avErrorToString(openRet)));
@@ -149,11 +144,8 @@ bool FFmpegVideoParser::openContainer(const QString &filePath)
 
 bool FFmpegVideoParser::probeStreams()
 {
-    /**
-     * avformat_find_stream_info:
-     *   - 读取一部分数据包，填充每个 AVStream 的 codecpar / 时长 / 帧率等
-     *   - 对部分格式（如 mpeg-ts）几乎是必须的
-     */
+    // [libavformat] avformat_find_stream_info：读一段数据，填各流 codecpar/时长/帧率。
+    // 形参：ic=已打开上下文；options=每流选项(nullptr=默认)。
     const int ret = avformat_find_stream_info(m_formatCtx, nullptr);
     if (ret < 0) {
         setError(QStringLiteral("avformat_find_stream_info failed: %1").arg(avErrorToString(ret)));
@@ -171,7 +163,7 @@ static qint64 ptsToMs(qint64 ts, AVRational timeBase)
     if (ts == AV_NOPTS_VALUE) {
         return -1;
     }
-    // av_rescale_q: ts * timeBase -> 毫秒(1/1000)
+    // [libavutil] av_rescale_q：按有理数换时间基。形参：a=时间戳；bq=源时间基；cq=1/1000 秒。
     return av_rescale_q(ts, timeBase, AVRational{1, 1000});
 }
 
@@ -201,6 +193,7 @@ MediaStreamInfo FFmpegVideoParser::buildStreamInfo(int streamIndex) const
     info.mediaType = mediaTypeName(par->codec_type);
     info.bitrate = par->bit_rate;
 
+    // [libavcodec] avcodec_find_decoder：按 codec_id 找解码器。形参：id。找不到再查名字。
     if (const AVCodec *codec = avcodec_find_decoder(par->codec_id)) {
         info.codecName = QString::fromUtf8(codec->name ? codec->name : "");
         info.codecLongName = QString::fromUtf8(codec->long_name ? codec->long_name : "");
@@ -221,11 +214,13 @@ MediaStreamInfo FFmpegVideoParser::buildStreamInfo(int streamIndex) const
 
         // avg_frame_rate 比 r_frame_rate 更接近“平均播放帧率”
         if (st->avg_frame_rate.den != 0) {
+            // [libavutil] av_q2d：AVRational → double（fps）。
             info.frameRate = av_q2d(st->avg_frame_rate);
         } else if (st->r_frame_rate.den != 0) {
             info.frameRate = av_q2d(st->r_frame_rate);
         }
 
+        // [libavutil] av_get_pix_fmt_name：像素格式枚举 → "yuv420p"。
         if (const char *pix = av_get_pix_fmt_name(static_cast<AVPixelFormat>(par->format))) {
             info.pixelFormat = QString::fromUtf8(pix);
         }
@@ -233,11 +228,14 @@ MediaStreamInfo FFmpegVideoParser::buildStreamInfo(int streamIndex) const
         info.sampleRate = par->sample_rate;
         info.channels = par->ch_layout.nb_channels;
 
+        // [libavutil] av_get_sample_fmt_name：采样格式枚举 → "fltp"。
         if (const char *sf = av_get_sample_fmt_name(static_cast<AVSampleFormat>(par->format))) {
             info.sampleFormat = QString::fromUtf8(sf);
         }
 
         char layoutBuf[128] = {0};
+        // [libavutil] av_channel_layout_describe：声道布局 → "stereo" 等。
+        // 形参：ch_layout；buf/buf_size=输出。
         if (av_channel_layout_describe(&par->ch_layout, layoutBuf, sizeof(layoutBuf)) >= 0) {
             info.channelLayout = QString::fromUtf8(layoutBuf);
         }
@@ -275,11 +273,8 @@ bool FFmpegVideoParser::buildMediaInfo()
         m_mediaInfo.streams.push_back(buildStreamInfo(static_cast<int>(i)));
     }
 
-    /**
-     * av_find_best_stream:
-     *   按“最合适播放”的启发式选择默认视频/音频流
-     *   （多音轨、多视频轨时很有用）
-     */
+    // [libavformat] av_find_best_stream：挑最适合播放的那条流。
+    // 形参：ic；type=VIDEO/AUDIO；wanted_stream_nb=-1；related_stream=-1；decoder_ret；flags=0。
     m_mediaInfo.videoStreamIndex = av_find_best_stream(m_formatCtx, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
     if (m_mediaInfo.videoStreamIndex < 0) {
         m_mediaInfo.videoStreamIndex = -1;
@@ -308,18 +303,21 @@ bool FFmpegVideoParser::openVideoDecoder()
 
     const int streamIndex = m_mediaInfo.videoStreamIndex;
     AVStream *st = m_formatCtx->streams[streamIndex];
+    // [libavcodec] avcodec_find_decoder：按流 codec_id 找解码器。
     const AVCodec *decoder = avcodec_find_decoder(st->codecpar->codec_id);
     if (!decoder) {
         setError(QStringLiteral("decoder not found for codec_id=%1").arg(st->codecpar->codec_id));
         return false;
     }
 
+    // [libavcodec] avcodec_alloc_context3：分配解码器运行上下文。形参：codec。
     AVCodecContext *codecCtx = avcodec_alloc_context3(decoder);
     if (!codecCtx) {
         setError(QStringLiteral("avcodec_alloc_context3 failed"));
         return false;
     }
 
+    // [libavcodec] avcodec_parameters_to_context：把流参数拷进解码器。形参：codec；par。
     int ret = avcodec_parameters_to_context(codecCtx, st->codecpar);
     if (ret < 0) {
         avcodec_free_context(&codecCtx);
@@ -327,6 +325,7 @@ bool FFmpegVideoParser::openVideoDecoder()
         return false;
     }
 
+    // [libavcodec] avcodec_open2：打开解码器。形参：avctx；codec；options=nullptr。
     ret = avcodec_open2(codecCtx, decoder, nullptr);
     if (ret < 0) {
         avcodec_free_context(&codecCtx);
@@ -342,6 +341,7 @@ bool FFmpegVideoParser::openVideoDecoder()
 void FFmpegVideoParser::closeVideoDecoder()
 {
     if (m_videoCodecCtx) {
+        // [libavcodec] avcodec_free_context：关解码器并释放上下文。
         avcodec_free_context(&m_videoCodecCtx);
         m_videoCodecCtx = nullptr;
     }
@@ -350,11 +350,6 @@ void FFmpegVideoParser::closeVideoDecoder()
 
 QImage FFmpegVideoParser::convertFrameToQImage(const AVFrame *frame) const
 {
-    /**
-     * sws_scale 负责 YUV/其他格式 -> RGB32（Qt 友好）
-     * 注意：这里每次抽帧都临时创建 SwsContext，简单清晰；
-     * 若做连续播放，应缓存 SwsContext 以提高性能。
-     */
     if (!frame || frame->width <= 0 || frame->height <= 0) {
         return {};
     }
@@ -362,6 +357,8 @@ QImage FFmpegVideoParser::convertFrameToQImage(const AVFrame *frame) const
     const AVPixelFormat srcFmt = static_cast<AVPixelFormat>(frame->format);
     const AVPixelFormat dstFmt = AV_PIX_FMT_RGB32;
 
+    // [libswscale] sws_getContext：创建像素转换器（抽帧用一次即丢，播放路径应缓存）。
+    // 形参：srcW/H/format；dstW/H/format=RGB32；flags=SWS_BILINEAR；滤镜全空。
     SwsContext *sws = sws_getContext(frame->width,
                                      frame->height,
                                      srcFmt,
@@ -380,6 +377,7 @@ QImage FFmpegVideoParser::convertFrameToQImage(const AVFrame *frame) const
     uint8_t *dstSlices[4] = {image.bits(), nullptr, nullptr, nullptr};
     int dstStrides[4] = {static_cast<int>(image.bytesPerLine()), 0, 0, 0};
 
+    // [libswscale] sws_scale：YUV → RGB 写入 QImage。形参：c；src/srcStride；srcSliceY/H；dst/dstStride。
     sws_scale(sws,
               frame->data,
               frame->linesize,
@@ -388,6 +386,7 @@ QImage FFmpegVideoParser::convertFrameToQImage(const AVFrame *frame) const
               dstSlices,
               dstStrides);
 
+    // [libswscale] sws_freeContext：释放转换器。
     sws_freeContext(sws);
     return image;
 }
@@ -403,6 +402,7 @@ QImage FFmpegVideoParser::extractFirstVideoFrame()
         return {};
     }
 
+    // [libavcodec] av_packet_alloc / [libavutil] av_frame_alloc：空压缩包与空解码帧。
     AVPacket *packet = av_packet_alloc();
     AVFrame *frame = av_frame_alloc();
     if (!packet || !frame) {
@@ -416,19 +416,15 @@ QImage FFmpegVideoParser::extractFirstVideoFrame()
     QImage result;
     bool gotFrame = false;
 
-    /**
-     * 解码循环（标准 FFmpeg 推荐写法）：
-     *   1) av_read_frame 取压缩包
-     *   2) 仅处理视频流 packet
-     *   3) avcodec_send_packet / avcodec_receive_frame
-     *   4) 拿到第一帧即可退出
-     */
+    // [libavformat] av_read_frame：读下一压缩包。形参：s；pkt。返回：>=0 成功。
     while (!gotFrame && av_read_frame(m_formatCtx, packet) >= 0) {
         if (packet->stream_index != m_activeVideoStream) {
+            // [libavcodec] av_packet_unref：丢掉本包数据，结构复用。
             av_packet_unref(packet);
             continue;
         }
 
+        // [libavcodec] avcodec_send_packet：送压缩包。pkt=nullptr 表示 flush。
         int ret = avcodec_send_packet(m_videoCodecCtx, packet);
         av_packet_unref(packet);
         if (ret < 0) {
@@ -437,6 +433,7 @@ QImage FFmpegVideoParser::extractFirstVideoFrame()
         }
 
         while (ret >= 0) {
+            // [libavcodec] avcodec_receive_frame：取一帧图像。EAGAIN=再 send；EOF=冲完。
             ret = avcodec_receive_frame(m_videoCodecCtx, frame);
             if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
                 break;
@@ -474,8 +471,9 @@ QImage FFmpegVideoParser::extractFirstVideoFrame()
     av_frame_free(&frame);
     closeVideoDecoder();
 
-    // 抽帧会推进 demux 位置；这里 seek 回开头，保证后续再次抽帧/解析可预期
+    // 抽帧会推进 demux 位置；seek 回开头
     if (m_formatCtx) {
+        // [libavformat] av_seek_frame：跳到时间戳。flags=BACKWARD 回关键帧。形参：s；stream=-1；timestamp=0。
         av_seek_frame(m_formatCtx, -1, 0, AVSEEK_FLAG_BACKWARD);
     }
 

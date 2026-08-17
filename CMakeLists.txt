@@ -15,6 +15,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(QT NAMES Qt6 Qt5 REQUIRED COMPONENTS Widgets Multimedia)
 find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Widgets Multimedia)
 
+if(QT_VERSION_MAJOR GREATER_EQUAL 6)
+    find_package(Qt6 REQUIRED COMPONENTS OpenGLWidgets OpenGL)
+else()
+    find_package(Qt5 REQUIRED COMPONENTS OpenGL)
+endif()
+
 # ---------------------------------------------------------------------------
 # FFmpeg（BtbN win64 lgpl-shared，已放在工程目录下）
 # 仓库保留完整共享包，便于他人克隆后直接编译、版本一致。
@@ -40,6 +46,18 @@ set(PROJECT_SOURCES
     media/FFmpegVideoParser.cpp
     media/FFmpegPlayer.h
     media/FFmpegPlayer.cpp
+    media/GpuVideoFrame.h
+    media/render/IVideoRenderer.h
+    media/render/VideoRendererFactory.h
+    media/render/VideoRendererFactory.cpp
+    media/render/QImageVideoRenderer.h
+    media/render/QImageVideoRenderer.cpp
+    media/render/OpenGLVideoRenderer.h
+    media/render/OpenGLVideoRenderer.cpp
+    media/render/D3D11VideoRenderer.h
+    media/render/D3D11VideoRenderer.cpp
+    media/render/D3D11SharedDevice.h
+    media/render/D3D11SharedDevice.cpp
 )
 
 if(${QT_VERSION_MAJOR} GREATER_EQUAL 6)
@@ -96,6 +114,19 @@ target_link_libraries(HgyPlayer PRIVATE
     Qt${QT_VERSION_MAJOR}::Widgets
     Qt${QT_VERSION_MAJOR}::Multimedia
 )
+
+if(QT_VERSION_MAJOR GREATER_EQUAL 6)
+    target_link_libraries(HgyPlayer PRIVATE
+        Qt6::OpenGLWidgets
+        Qt6::OpenGL
+    )
+else()
+    target_link_libraries(HgyPlayer PRIVATE Qt5::OpenGL)
+endif()
+
+if(WIN32)
+    target_link_libraries(HgyPlayer PRIVATE d3d11 dxgi d3dcompiler)
+endif()
 
 # ---------------------------------------------------------------------------
 # Windows 运行目录：最小可用 DLL 拷贝（仓库 bin/ 仍保留完整包，不在此删文件）

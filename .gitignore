@@ -20,9 +20,11 @@ CMakeLists.txt.user.*
 
 # ----- CMake / 构建产物 -----
 build/
+build-package/
 cmake-build-*/
 out/
 install/
+dist/
 CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake

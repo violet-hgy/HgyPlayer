@@ -1,14 +1,18 @@
 #include "mainwindow.h"
 
+#include "render/D3D11SharedDevice.h"
+#include "render/VideoRendererFactory.h"
+
 #include <QFileDialog>
 #include <QHBoxLayout>
 #include <QMessageBox>
-#include <QPixmap>
+#include <QMetaObject>
 #include <QSplitter>
 #include <QVBoxLayout>
 #include <QWidget>
 
 #include <climits>
+#include <memory>
 
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
@@ -26,6 +30,15 @@ MainWindow::MainWindow(QWidget *parent)
     m_playBtn->setEnabled(false);
     m_stopBtn->setEnabled(false);
 
+    m_rendererCombo = new QComboBox(central);
+    m_rendererCombo->addItem(QStringLiteral("QImage"), int(IVideoRenderer::Backend::QImage));
+    m_rendererCombo->addItem(QStringLiteral("OpenGL"), int(IVideoRenderer::Backend::OpenGL));
+#ifdef Q_OS_WIN
+    m_rendererCombo->addItem(QStringLiteral("D3D11"), int(IVideoRenderer::Backend::D3D11));
+    m_rendererCombo->addItem(QStringLiteral("D3D11 硬解"), int(IVideoRenderer::Backend::D3D11Hw));
+#endif
+    m_rendererCombo->setToolTip(QStringLiteral("视频渲染后端"));
+
     m_seekSlider = new QSlider(Qt::Horizontal, central);
     m_seekSlider->setRange(0, 0);
     m_seekSlider->setEnabled(false);
@@ -33,10 +46,10 @@ MainWindow::MainWindow(QWidget *parent)
     m_timeLabel = new QLabel(QStringLiteral("00:00 / 00:00"), central);
     m_timeLabel->setMinimumWidth(110);
 
-    m_videoLabel = new QLabel(QStringLiteral("打开文件后点击播放"), central);
-    m_videoLabel->setAlignment(Qt::AlignCenter);
-    m_videoLabel->setMinimumSize(640, 360);
-    m_videoLabel->setStyleSheet(QStringLiteral("QLabel { background: #111111; color: #cccccc; }"));
+    m_videoHost = new QWidget(central);
+    auto *videoLayout = new QVBoxLayout(m_videoHost);
+    videoLayout->setContentsMargins(0, 0, 0, 0);
+    videoLayout->setSpacing(0);
 
     m_infoEdit = new QPlainTextEdit(central);
     m_infoEdit->setReadOnly(true);
@@ -46,36 +59,147 @@ MainWindow::MainWindow(QWidget *parent)
     btnRow->addWidget(m_openBtn);
     btnRow->addWidget(m_playBtn);
     btnRow->addWidget(m_stopBtn);
+    btnRow->addWidget(m_rendererCombo);
     btnRow->addWidget(m_seekSlider, 1);
     btnRow->addWidget(m_timeLabel);
 
-    auto *splitter = new QSplitter(Qt::Horizontal, central);
-    splitter->addWidget(m_videoLabel);
-    splitter->addWidget(m_infoEdit);
-    splitter->setStretchFactor(0, 3);
-    splitter->setStretchFactor(1, 1);
+    m_splitter = new QSplitter(Qt::Horizontal, central);
+    m_splitter->addWidget(m_videoHost);
+    m_splitter->addWidget(m_infoEdit);
+    m_splitter->setStretchFactor(0, 3);
+    m_splitter->setStretchFactor(1, 1);
 
     auto *layout = new QVBoxLayout(central);
     layout->addLayout(btnRow);
-    layout->addWidget(splitter, 1);
+    layout->addWidget(m_splitter, 1);
+
+    // 默认 QImage 后端
+    switchRenderer(IVideoRenderer::Backend::QImage);
 
     connect(m_openBtn, &QPushButton::clicked, this, &MainWindow::onOpen);
     connect(m_playBtn, &QPushButton::clicked, this, &MainWindow::onPlayPause);
     connect(m_stopBtn, &QPushButton::clicked, this, &MainWindow::onStop);
+    connect(m_rendererCombo,
+            QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this,
+            &MainWindow::onRendererChanged);
 
     connect(m_seekSlider, &QSlider::sliderPressed, this, &MainWindow::onSeekPressed);
     connect(m_seekSlider, &QSlider::sliderReleased, this, &MainWindow::onSeekReleased);
     connect(m_seekSlider, &QSlider::valueChanged, this, &MainWindow::onSeekMoved);
 
-    // UI 只订阅播放器信号，不介入 demux/解码/时钟
     connect(m_player, &FFmpegPlayer::frameReady, this, &MainWindow::onFrameReady);
+    connect(m_player, &FFmpegPlayer::gpuFrameReady, this, &MainWindow::onGpuFrameReady);
     connect(m_player, &FFmpegPlayer::positionChanged, this, &MainWindow::onPositionChanged);
     connect(m_player, &FFmpegPlayer::stateChanged, this, &MainWindow::onStateChanged);
     connect(m_player, &FFmpegPlayer::errorOccurred, this, &MainWindow::onPlayerError);
     connect(m_player, &FFmpegPlayer::playbackFinished, this, &MainWindow::onPlaybackFinished);
 }
 
-MainWindow::~MainWindow() = default;
+MainWindow::~MainWindow()
+{
+    m_presentScheduled = false;
+    m_latestFrame = QImage();
+    m_latestGpu = {};
+    if (m_player) {
+        disconnect(m_player, nullptr, this, nullptr);
+        m_player->stop();
+    }
+    // 播放器停干净后再拆渲染器，避免退出过程中仍 present 到半销毁的 D3D 窗口
+    m_renderer.reset();
+}
+
+bool MainWindow::switchRenderer(IVideoRenderer::Backend backend)
+{
+    const QString reopenPath = m_player->isOpen() ? m_player->mediaInfo().filePath : QString();
+    const qint64 reopenPos = m_player->positionMs();
+    const bool wasPlaying = m_player->state() == FFmpegPlayer::State::Playing;
+    if (m_player->isOpen()) {
+        m_player->stop();
+    }
+
+    auto next = VideoRendererFactory::create(backend, m_videoHost);
+    if (!next || !next->widget()) {
+        QMessageBox::warning(this,
+                             QStringLiteral("渲染器"),
+                             QStringLiteral("无法创建渲染后端：%1")
+                                 .arg(VideoRendererFactory::backendName(backend)));
+        return false;
+    }
+
+    QLayout *lay = m_videoHost->layout();
+    if (lay) {
+        while (QLayoutItem *item = lay->takeAt(0)) {
+            delete item;
+        }
+    }
+
+    m_renderer.reset();
+    m_renderer = std::move(next);
+    if (lay) {
+        lay->addWidget(m_renderer->widget());
+    }
+    m_renderer->widget()->show();
+    m_renderer->clear(QStringLiteral("打开文件后点击播放"));
+    m_latestGpu = {};
+
+    bindPlayerToRenderer();
+
+    if (!reopenPath.isEmpty()) {
+        if (!m_player->open(reopenPath)) {
+            QMessageBox::warning(this, QStringLiteral("打开失败"), m_player->lastError());
+            setTransportEnabled(false);
+            return true;
+        }
+        showMediaSummary(m_player->mediaInfo());
+        const qint64 duration = qMax<qint64>(0, m_player->durationMs());
+        m_seekSlider->setRange(0, static_cast<int>(qMin(duration, static_cast<qint64>(INT_MAX))));
+        m_seekSlider->setEnabled(duration > 0);
+        setTransportEnabled(true);
+        if (reopenPos > 0) {
+            m_player->seek(reopenPos);
+        }
+        if (wasPlaying) {
+            m_player->play();
+        }
+    } else if (!m_latestFrame.isNull()) {
+        m_renderer->present(m_latestFrame);
+    }
+    return true;
+}
+
+void MainWindow::bindPlayerToRenderer()
+{
+    std::shared_ptr<D3D11SharedDevice> dev;
+    if (m_renderer && m_renderer->backend() == IVideoRenderer::Backend::D3D11Hw) {
+        dev = m_renderer->d3d11SharedDevice();
+    }
+    m_player->setD3D11SharedDevice(dev);
+}
+
+void MainWindow::onRendererChanged(int index)
+{
+    if (index < 0 || !m_rendererCombo) {
+        return;
+    }
+    const auto backend =
+        static_cast<IVideoRenderer::Backend>(m_rendererCombo->itemData(index).toInt());
+    if (m_renderer && m_renderer->backend() == backend) {
+        return;
+    }
+    if (!switchRenderer(backend)) {
+        // 回退到当前成功后端的下拉项
+        for (int i = 0; i < m_rendererCombo->count(); ++i) {
+            if (m_renderer
+                && m_rendererCombo->itemData(i).toInt() == int(m_renderer->backend())) {
+                m_rendererCombo->blockSignals(true);
+                m_rendererCombo->setCurrentIndex(i);
+                m_rendererCombo->blockSignals(false);
+                break;
+            }
+        }
+    }
+}
 
 void MainWindow::onOpen()
 {
@@ -90,7 +214,6 @@ void MainWindow::onOpen()
 
     m_player->stop();
 
-    // 打开/解析媒体信息全部由播放器完成
     if (!m_player->open(path)) {
         QMessageBox::warning(this, QStringLiteral("打开失败"), m_player->lastError());
         setTransportEnabled(false);
@@ -105,7 +228,11 @@ void MainWindow::onOpen()
     m_seekSlider->setEnabled(duration > 0);
     setTransportEnabled(true);
     m_playBtn->setText(QStringLiteral("播放"));
-    m_videoLabel->setText(QStringLiteral("已加载，点击播放"));
+    m_latestFrame = QImage();
+    m_latestGpu = {};
+    if (m_renderer) {
+        m_renderer->clear(QStringLiteral("已加载，点击播放"));
+    }
     updateTimeLabel();
 }
 
@@ -125,6 +252,11 @@ void MainWindow::onStop()
 {
     m_player->stop();
     m_seekSlider->setValue(0);
+    m_latestFrame = QImage();
+    m_latestGpu = {};
+    if (m_renderer) {
+        m_renderer->clear(QStringLiteral("已停止"));
+    }
     updateTimeLabel();
 }
 
@@ -148,7 +280,6 @@ void MainWindow::onSeekReleased()
 void MainWindow::onSeekMoved(int value)
 {
     if (m_sliderPressed) {
-        // 拖动中只预览时间文字，松手后再真正 seek
         m_timeLabel->setText(QStringLiteral("%1 / %2")
                                  .arg(formatTime(value), formatTime(m_player->durationMs())));
     }
@@ -159,13 +290,47 @@ void MainWindow::onFrameReady(const QImage &frame, qint64)
     if (frame.isNull()) {
         return;
     }
-    m_videoLabel->setPixmap(QPixmap::fromImage(frame).scaled(
-        m_videoLabel->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
+
+    m_latestGpu = {};
+    m_latestFrame = frame;
+    if (m_presentScheduled) {
+        return;
+    }
+    m_presentScheduled = true;
+    QMetaObject::invokeMethod(this, &MainWindow::presentVideoFrame, Qt::QueuedConnection);
+}
+
+void MainWindow::onGpuFrameReady(GpuVideoFrame frame)
+{
+    if (!frame.isValid()) {
+        return;
+    }
+    m_latestFrame = QImage();
+    m_latestGpu = std::move(frame);
+    if (m_presentScheduled) {
+        return;
+    }
+    m_presentScheduled = true;
+    QMetaObject::invokeMethod(this, &MainWindow::presentVideoFrame, Qt::QueuedConnection);
+}
+
+void MainWindow::presentVideoFrame()
+{
+    m_presentScheduled = false;
+    if (!m_renderer) {
+        return;
+    }
+    if (m_latestGpu.isValid() && m_renderer->supportsGpuFrames()) {
+        m_renderer->presentGpu(m_latestGpu);
+        return;
+    }
+    if (!m_latestFrame.isNull()) {
+        m_renderer->present(m_latestFrame);
+    }
 }
 
 void MainWindow::onPositionChanged(qint64 ms)
 {
-    // seek 过期进度过滤已在 FFmpegPlayer 内部完成，此处只刷新 UI
     if (!m_sliderPressed && m_seekSlider->isEnabled()) {
         m_seekSlider->blockSignals(true);
         const qint64 maxPos = m_seekSlider->maximum();
@@ -208,9 +373,11 @@ void MainWindow::showMediaSummary(const MediaInfo &info)
     text += QStringLiteral("容器: %1 (%2)\n").arg(info.formatName, info.formatLongName);
     text += QStringLiteral("时长: %1\n").arg(formatTime(info.durationMs));
     text += QStringLiteral("码率: %1 bps\n").arg(info.bitrate);
-    text += QStringLiteral("视频流: %1, 音频流: %2\n\n")
-                .arg(info.videoStreamIndex)
-                .arg(info.audioStreamIndex);
+    text += QStringLiteral("视频流: %1, 音频流: %2\n").arg(info.videoStreamIndex).arg(info.audioStreamIndex);
+    text += QStringLiteral("解码: %1\n\n")
+                .arg(m_player->hardwareDecodeActive()
+                         ? QStringLiteral("D3D11VA 硬解（GPU 零拷贝）")
+                         : QStringLiteral("软解"));
 
     for (const MediaStreamInfo &s : info.streams) {
         text += QStringLiteral("---- stream #%1 [%2] ----\n").arg(s.index).arg(s.mediaType);

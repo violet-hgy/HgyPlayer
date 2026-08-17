@@ -24,14 +24,19 @@
  * - open / play / pause / seek / stop：调用线程（建议 UI 线程）
  * - demux / decode / 同步等待：Worker 线程
  * - frameReady：队列连接回 UI 线程显示
+ *
+ * FFmpeg C API 说明写在 FFmpegPlayer.cpp 各调用处（Qt/C++ 不注释）。
  */
 
+#include "GpuVideoFrame.h"
 #include "MediaTypes.h"
 
 #include <QImage>
 #include <QObject>
 #include <QString>
+#include <memory>
 
+class D3D11SharedDevice;
 class FFmpegPlayerPrivate;
 
 /**
@@ -93,6 +98,16 @@ public:
      */
     void seek(qint64 positionMs);
 
+    /**
+     * @brief 绑定 D3D11 共享设备以启用 D3D11VA 硬解零拷贝
+     * @param device 空指针则退回软解 + QImage
+     *
+     * 须在 open() 之前调用；切换渲染后端时由 MainWindow 先 stop 再设再 reopen。
+     */
+    void setD3D11SharedDevice(std::shared_ptr<D3D11SharedDevice> device);
+
+    bool hardwareDecodeActive() const;
+
     // ============================================================
     // 只读状态
     // ============================================================
@@ -106,6 +121,9 @@ public:
 signals:
     /** 解码并转换完成的一帧画面（RGB32），供 UI 显示 */
     void frameReady(const QImage &frame, qint64 ptsMs);
+
+    /** D3D11VA 硬解产出的 GPU 帧（无 CPU 像素） */
+    void gpuFrameReady(GpuVideoFrame frame);
 
     void positionChanged(qint64 positionMs);
     void stateChanged(FFmpegPlayer::State state);

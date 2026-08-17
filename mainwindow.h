@@ -2,20 +2,27 @@
 #define MAINWINDOW_H
 
 #include "FFmpegPlayer.h"
+#include "GpuVideoFrame.h"
 #include "MediaTypes.h"
+#include "render/IVideoRenderer.h"
 
+#include <QComboBox>
 #include <QLabel>
 #include <QMainWindow>
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QSlider>
 
+#include <memory>
+
+class QSplitter;
+
 /**
  * @brief 主窗口（仅 UI）
  *
  * 职责：布局、按钮/进度条交互、把用户操作转发给 FFmpegPlayer，
  * 并根据播放器信号刷新画面与状态。
- * 不包含 demux / 解码 / 时钟同步等播放内核逻辑。
+ * 画面绘制交给 IVideoRenderer（QImage / OpenGL / D3D11）。
  */
 class MainWindow : public QMainWindow
 {
@@ -32,31 +39,44 @@ private slots:
     void onSeekPressed();
     void onSeekReleased();
     void onSeekMoved(int value);
+    void onRendererChanged(int index);
 
     void onFrameReady(const QImage &frame, qint64 ptsMs);
+    void onGpuFrameReady(GpuVideoFrame frame);
     void onPositionChanged(qint64 ms);
     void onStateChanged(FFmpegPlayer::State state);
     void onPlayerError(const QString &message);
     void onPlaybackFinished();
+    void presentVideoFrame();
 
 private:
     void showMediaSummary(const MediaInfo &info);
     void updateTimeLabel();
     void setTransportEnabled(bool enabled);
+    bool switchRenderer(IVideoRenderer::Backend backend);
+    void bindPlayerToRenderer();
     static QString formatTime(qint64 ms);
 
 private:
-    FFmpegPlayer *m_player = nullptr; ///< 专用播放器封装，所有播放逻辑在其内部
+    FFmpegPlayer *m_player = nullptr;
 
-    QLabel *m_videoLabel = nullptr;
+    QWidget *m_videoHost = nullptr; ///< 渲染器 widget 的容器
+    std::unique_ptr<IVideoRenderer> m_renderer;
+
     QPlainTextEdit *m_infoEdit = nullptr;
     QPushButton *m_openBtn = nullptr;
     QPushButton *m_playBtn = nullptr;
     QPushButton *m_stopBtn = nullptr;
+    QComboBox *m_rendererCombo = nullptr;
     QSlider *m_seekSlider = nullptr;
     QLabel *m_timeLabel = nullptr;
+    QSplitter *m_splitter = nullptr;
 
-    bool m_sliderPressed = false; ///< 拖动进度条时暂停用 position 回写滑块
+    bool m_sliderPressed = false;
+
+    QImage m_latestFrame;
+    GpuVideoFrame m_latestGpu;
+    bool m_presentScheduled = false;
 };
 
 #endif // MAINWINDOW_H
