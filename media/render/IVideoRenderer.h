@@ -8,7 +8,8 @@
  * 播放器产出 QImage（软解）或 GpuVideoFrame（D3D11 硬解零拷贝）；
  * 具体如何画到屏幕由渲染后端决定：
  *   - QImage：QLabel + QPixmap（软件缩放）
- *   - OpenGL：GPU 纹理上传 + 着色器绘制
+ *   - OpenGL：QOpenGLWidget（Qt 封装）
+ *   - OpenGL 库：WGL + opengl32（自行建上下文、编译着色器、上传纹理）
  *   - D3D11：Direct3D 11 交换链（可接 CPU 图或硬解 GPU 帧）
  */
 
@@ -27,6 +28,7 @@ public:
     enum class Backend {
         QImage,
         OpenGL,
+        OpenGLNative, ///< WGL + opengl32，不经过 QOpenGLWidget
         D3D11,
         D3D11Hw ///< D3D11 显示 + D3D11VA 硬解零拷贝
     };

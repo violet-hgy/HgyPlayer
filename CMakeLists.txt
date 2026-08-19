@@ -54,6 +54,8 @@ set(PROJECT_SOURCES
     media/render/QImageVideoRenderer.cpp
     media/render/OpenGLVideoRenderer.h
     media/render/OpenGLVideoRenderer.cpp
+    media/render/NativeOpenGLVideoRenderer.h
+    media/render/NativeOpenGLVideoRenderer.cpp
     media/render/D3D11VideoRenderer.h
     media/render/D3D11VideoRenderer.cpp
     media/render/D3D11SharedDevice.h
@@ -125,7 +127,7 @@ else()
 endif()
 
 if(WIN32)
-    target_link_libraries(HgyPlayer PRIVATE d3d11 dxgi d3dcompiler)
+    target_link_libraries(HgyPlayer PRIVATE d3d11 dxgi d3dcompiler opengl32)
 endif()
 
 # ---------------------------------------------------------------------------

@@ -1047,6 +1047,14 @@ private:
                         }
                     }
                 }
+                // 末帧 PTS 是该帧起始时刻，通常比容器时长少一帧；不把时钟拉到结尾会显示 00:04 / 00:05。
+                if (!m_abort.load() && !m_seekReq.load() && m_durationMs > 0) {
+                    const qint64 endMs = qMax(m_clockMs.load(), m_durationMs);
+                    waitForPts(endMs);
+                    if (!m_abort.load() && !m_seekReq.load()) {
+                        updateClock(endMs);
+                    }
+                }
                 break;
             }
 
@@ -1266,6 +1274,10 @@ FFmpegPlayer::FFmpegPlayer(QObject *parent)
     });
     connect(d->worker, &PlayerWorker::playbackFinished, this, [this]() {
         stopAudioDevice(d);
+        if (d->durationMs > 0) {
+            d->positionMs.store(d->durationMs);
+            emit positionChanged(d->durationMs);
+        }
         emit playbackFinished();
     });
 

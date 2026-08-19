@@ -32,8 +32,9 @@ MainWindow::MainWindow(QWidget *parent)
 
     m_rendererCombo = new QComboBox(central);
     m_rendererCombo->addItem(QStringLiteral("QImage"), int(IVideoRenderer::Backend::QImage));
-    m_rendererCombo->addItem(QStringLiteral("OpenGL"), int(IVideoRenderer::Backend::OpenGL));
+    m_rendererCombo->addItem(QStringLiteral("OpenGL (Qt)"), int(IVideoRenderer::Backend::OpenGL));
 #ifdef Q_OS_WIN
+    m_rendererCombo->addItem(QStringLiteral("OpenGL"), int(IVideoRenderer::Backend::OpenGLNative));
     m_rendererCombo->addItem(QStringLiteral("D3D11"), int(IVideoRenderer::Backend::D3D11));
     m_rendererCombo->addItem(QStringLiteral("D3D11 硬解"), int(IVideoRenderer::Backend::D3D11Hw));
 #endif
@@ -364,6 +365,7 @@ void MainWindow::onPlayerError(const QString &message)
 void MainWindow::onPlaybackFinished()
 {
     m_playBtn->setText(QStringLiteral("播放"));
+    updateTimeLabel();
 }
 
 void MainWindow::showMediaSummary(const MediaInfo &info)
