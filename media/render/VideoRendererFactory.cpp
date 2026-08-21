@@ -8,6 +8,8 @@
 #include "NativeOpenGLVideoRenderer.h"
 #endif
 
+#include "cef/CefVideoRenderer.h"
+
 std::unique_ptr<IVideoRenderer> VideoRendererFactory::create(IVideoRenderer::Backend backend,
                                                              QWidget *parent)
 {
@@ -35,6 +37,13 @@ std::unique_ptr<IVideoRenderer> VideoRendererFactory::create(IVideoRenderer::Bac
         Q_UNUSED(parent);
         return nullptr;
 #endif
+    case IVideoRenderer::Backend::Cef:
+#ifdef Q_OS_WIN
+        return std::make_unique<CefVideoRenderer>(parent);
+#else
+        Q_UNUSED(parent);
+        return nullptr;
+#endif
     }
     return nullptr;
 }
@@ -52,6 +61,8 @@ QString VideoRendererFactory::backendName(IVideoRenderer::Backend backend)
         return QStringLiteral("D3D11");
     case IVideoRenderer::Backend::D3D11Hw:
         return QStringLiteral("D3D11 硬解");
+    case IVideoRenderer::Backend::Cef:
+        return QStringLiteral("CEF (Browser)");
     }
     return QStringLiteral("Unknown");
 }

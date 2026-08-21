@@ -30,7 +30,8 @@ public:
         OpenGL,
         OpenGLNative, ///< WGL + opengl32，不经过 QOpenGLWidget
         D3D11,
-        D3D11Hw ///< D3D11 显示 + D3D11VA 硬解零拷贝
+        D3D11Hw, ///< D3D11 显示 + D3D11VA 硬解零拷贝
+        Cef      ///< Chromium Embedded Framework · HTML5 视频
     };
 
     virtual ~IVideoRenderer() = default;

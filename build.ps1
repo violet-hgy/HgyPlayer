@@ -13,6 +13,8 @@
     .\build.ps1 -Clean
     .\build.ps1 -Toolchain mingw
     .\build.ps1 -QtVersion 6.10.2 -NoZip
+    .\build.ps1 -EnableCef
+    .\scripts\setup-cef.ps1   # 首次下载 CEF SDK
 #>
 [CmdletBinding()]
 param(
@@ -33,6 +35,9 @@ param(
     [switch]$Clean,
     [switch]$NoPackage,
     [switch]$NoZip,
+
+    [switch]$EnableCef,
+    [string]$CefRoot = "",
 
     [int]$Jobs = 0
 )
@@ -276,6 +281,18 @@ if ($Toolchain -eq "mingw") {
     $cl = (Get-Command cl.exe).Source
     $cmakeConfigureArgs += "-DCMAKE_CXX_COMPILER=$cl"
     $cmakeConfigureArgs += "-DCMAKE_C_COMPILER=$cl"
+}
+
+if ($EnableCef) {
+    if (-not $CefRoot) {
+        $CefRoot = Join-Path $ProjectRoot "third_party\cef"
+    }
+    if (-not (Test-Path (Join-Path $CefRoot "include\cef_app.h"))) {
+        Write-Fail "CEF SDK not found at: $CefRoot`nRun: .\scripts\setup-cef.ps1"
+    }
+    $cmakeConfigureArgs += "-DHGY_ENABLE_CEF=ON"
+    $cmakeConfigureArgs += "-DCEF_ROOT=$CefRoot"
+    Write-Ok "CEF enabled -> $CefRoot"
 }
 
 Write-Host ("    " + ($cmakeConfigureArgs -join " "))

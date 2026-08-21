@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    background: #000;
+    overflow: hidden;
+  }
+  video {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    background: #000;
+  }
+  #hint {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #888;
+    font: 14px sans-serif;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+<div id="hint">HgyPlayer · CEF</div>
+<video id="player" playsinline preload="auto"></video>
+<script>
+(function () {
+  const video = document.getElementById('player');
+  const hint = document.getElementById('hint');
+
+  function showHint(text) {
+    hint.textContent = text;
+    hint.style.display = text ? 'flex' : 'none';
+  }
+
+  video.addEventListener('playing', function () { showHint(''); });
+  video.addEventListener('emptied', function () { showHint('HgyPlayer · CEF'); });
+
+  window.hgyPlayer = {
+    load: function (url) {
+      video.src = url;
+      video.load();
+    },
+    play: function () { return video.play(); },
+    pause: function () { video.pause(); },
+    stop: function () {
+      video.pause();
+      video.currentTime = 0;
+    },
+    seek: function (sec) {
+      if (!isNaN(sec)) video.currentTime = sec;
+    },
+    currentTimeMs: function () {
+      return Math.round((video.currentTime || 0) * 1000);
+    }
+  };
+})();
+</script>
+</body>
+</html>

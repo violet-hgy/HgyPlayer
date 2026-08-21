@@ -64,6 +64,8 @@ ui_*.h
 # ----- 压缩包（源码仓库不提交安装包压缩文件） -----
 *.7z
 *.zip
+*.tar.bz2
+third_party/cef_binary_*.tar.bz2
 !doc/**
 
 # ----- 系统 / 杂项 -----

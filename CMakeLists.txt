@@ -6,7 +6,7 @@ set(CMAKE_AUTOUIC ON)
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # ---------------------------------------------------------------------------
@@ -60,7 +60,43 @@ set(PROJECT_SOURCES
     media/render/D3D11VideoRenderer.cpp
     media/render/D3D11SharedDevice.h
     media/render/D3D11SharedDevice.cpp
+    media/render/IBrowserPlayback.h
+    media/render/cef/ICefBrowserHost.h
+    media/render/cef/CefRuntimeFacade.h
+    media/render/cef/CefRuntimeFacade.cpp
+    media/render/cef/CefBrowserHostStub.h
+    media/render/cef/CefBrowserHostStub.cpp
+    media/render/cef/CefVideoRenderer.h
+    media/render/cef/CefVideoRenderer.cpp
 )
+
+# ---------------------------------------------------------------------------
+# CEF：third_party/cef 存在则默认启用（覆盖旧 CMake 缓存里的 OFF）
+# 显式关闭：-DHGY_ENABLE_CEF=OFF
+# ---------------------------------------------------------------------------
+set(CEF_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/cef" CACHE PATH "CEF binary distribution root")
+if(EXISTS "${CEF_ROOT}/include/cef_app.h")
+    set(HGY_ENABLE_CEF ON CACHE BOOL "Enable Chromium Embedded Framework browser renderer" FORCE)
+else()
+    set(HGY_ENABLE_CEF OFF CACHE BOOL "Enable Chromium Embedded Framework browser renderer" FORCE)
+endif()
+
+if(HGY_ENABLE_CEF)
+    list(APPEND PROJECT_SOURCES
+        media/render/cef/CefRuntimeImpl.h
+        media/render/cef/CefRuntimeImpl.cpp
+        media/render/cef/CefBrowserHostImpl.h
+        media/render/cef/CefBrowserHostImpl.cpp
+        media/render/cef/CefAppHandler.h
+        media/render/cef/CefAppHandler.cpp
+        media/render/cef/CefClientHandler.h
+        media/render/cef/CefClientHandler.cpp
+    )
+    list(REMOVE_ITEM PROJECT_SOURCES
+        media/render/cef/CefBrowserHostStub.h
+        media/render/cef/CefBrowserHostStub.cpp
+    )
+endif()
 
 if(${QT_VERSION_MAJOR} GREATER_EQUAL 6)
     qt_add_executable(HgyPlayer
@@ -82,6 +118,7 @@ endif()
 # 让 #include "MediaTypes.h" / "FFmpegVideoParser.h" 可用
 target_include_directories(HgyPlayer PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/media"
+    "${CMAKE_CURRENT_SOURCE_DIR}/media/render"
     "${FFMPEG_ROOT}/include"
 )
 
@@ -128,6 +165,87 @@ endif()
 
 if(WIN32)
     target_link_libraries(HgyPlayer PRIVATE d3d11 dxgi d3dcompiler opengl32)
+endif()
+
+if(HGY_ENABLE_CEF)
+    if(NOT EXISTS "${CEF_ROOT}/include/cef_app.h")
+        message(FATAL_ERROR "HGY_ENABLE_CEF=ON but CEF SDK not found at: ${CEF_ROOT}")
+    endif()
+    if(NOT EXISTS "${CEF_ROOT}/libcef_dll/CMakeLists.txt")
+        message(FATAL_ERROR "CEF libcef_dll wrapper not found under: ${CEF_ROOT}/libcef_dll")
+    endif()
+
+    # Use non-bootstrap/non-sandbox mode to match single-exe integration.
+    set(USE_SANDBOX OFF CACHE BOOL "Disable CEF sandbox/bootstrap mode" FORCE)
+
+    # 使用标准 MSVC 运行时：Debug=/MDd, Release=/MD，与 Qt Kit 保持一致。
+    set(CEF_RUNTIME_LIBRARY_FLAG "/MD" CACHE STRING "Match Qt runtime" FORCE)
+    # 规避 mspdbsrv 间歇性故障（C1090/0x6BA），优先使用 /Z7 减少独立 PDB 写入竞争。
+    set(CEF_DEBUG_INFO_FLAG "/Z7" CACHE STRING "Use /Z7 to avoid PDB server flakiness" FORCE)
+
+    list(APPEND CMAKE_MODULE_PATH "${CEF_ROOT}/cmake")
+    find_package(CEF REQUIRED)
+
+    add_subdirectory(${CEF_LIBCEF_DLL_WRAPPER_PATH} libcef_dll_wrapper EXCLUDE_FROM_ALL)
+    ADD_LOGICAL_TARGET("libcef_lib" "${CEF_LIB_DEBUG}" "${CEF_LIB_RELEASE}")
+
+    target_compile_definitions(HgyPlayer PRIVATE HGY_ENABLE_CEF=1 NOMINMAX)
+    target_include_directories(HgyPlayer PRIVATE "${CEF_ROOT}")
+
+    add_dependencies(HgyPlayer libcef_dll_wrapper)
+    if(MSVC)
+        set_property(TARGET HgyPlayer PROPERTY
+            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+        set_property(TARGET libcef_dll_wrapper PROPERTY
+            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+        target_compile_options(HgyPlayer PRIVATE $<$<CONFIG:Debug>:/FS>)
+    endif()
+    target_link_libraries(HgyPlayer PRIVATE
+        libcef_lib
+        libcef_dll_wrapper
+        ${CEF_STANDARD_LIBS}
+    )
+
+    if(CEF_EXE_LINKER_FLAGS_RELEASE)
+        target_link_options(HgyPlayer PRIVATE ${CEF_EXE_LINKER_FLAGS_RELEASE})
+    endif()
+    if(CEF_EXE_LINKER_FLAGS_DEBUG)
+        target_link_options(HgyPlayer PRIVATE ${CEF_EXE_LINKER_FLAGS_DEBUG})
+    endif()
+
+    if(WIN32)
+        set(_cef_copy_cmds "")
+        foreach(_cef_dll IN LISTS CEF_BINARY_FILES)
+            list(APPEND _cef_copy_cmds
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "$<IF:$<CONFIG:Debug>,${CEF_BINARY_DIR_DEBUG},${CEF_BINARY_DIR_RELEASE}>/${_cef_dll}"
+                    "$<TARGET_FILE_DIR:HgyPlayer>"
+            )
+        endforeach()
+        if(EXISTS "${CEF_RESOURCE_DIR}")
+            foreach(_cef_resource IN LISTS CEF_RESOURCE_FILES)
+                if(NOT _cef_resource STREQUAL "locales")
+                    list(APPEND _cef_copy_cmds
+                        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                            "${CEF_RESOURCE_DIR}/${_cef_resource}"
+                            "$<TARGET_FILE_DIR:HgyPlayer>/${_cef_resource}"
+                    )
+                endif()
+            endforeach()
+            list(APPEND _cef_copy_cmds
+                COMMAND ${CMAKE_COMMAND} -E copy_directory
+                    "${CEF_RESOURCE_DIR}/locales"
+                    "$<TARGET_FILE_DIR:HgyPlayer>/locales"
+                COMMAND ${CMAKE_COMMAND} -E copy_directory
+                    "${CEF_RESOURCE_DIR}"
+                    "$<TARGET_FILE_DIR:HgyPlayer>/Resources"
+            )
+        endif()
+        add_custom_command(TARGET HgyPlayer POST_BUILD
+            ${_cef_copy_cmds}
+            COMMENT "Copy CEF runtime next to HgyPlayer"
+        )
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------

@@ -1,6 +1,8 @@
 #include "mainwindow.h"
 
+#include "FFmpegVideoParser.h"
 #include "render/D3D11SharedDevice.h"
+#include "render/IBrowserPlayback.h"
 #include "render/VideoRendererFactory.h"
 
 #include <QFileDialog>
@@ -37,6 +39,7 @@ MainWindow::MainWindow(QWidget *parent)
     m_rendererCombo->addItem(QStringLiteral("OpenGL"), int(IVideoRenderer::Backend::OpenGLNative));
     m_rendererCombo->addItem(QStringLiteral("D3D11"), int(IVideoRenderer::Backend::D3D11));
     m_rendererCombo->addItem(QStringLiteral("D3D11 硬解"), int(IVideoRenderer::Backend::D3D11Hw));
+    m_rendererCombo->addItem(QStringLiteral("CEF (Browser)"), int(IVideoRenderer::Backend::Cef));
 #endif
     m_rendererCombo->setToolTip(QStringLiteral("视频渲染后端"));
 
@@ -95,10 +98,14 @@ MainWindow::MainWindow(QWidget *parent)
     connect(m_player, &FFmpegPlayer::stateChanged, this, &MainWindow::onStateChanged);
     connect(m_player, &FFmpegPlayer::errorOccurred, this, &MainWindow::onPlayerError);
     connect(m_player, &FFmpegPlayer::playbackFinished, this, &MainWindow::onPlaybackFinished);
+
+    m_browserPositionTimer.setInterval(250);
+    connect(&m_browserPositionTimer, &QTimer::timeout, this, &MainWindow::onBrowserPositionTick);
 }
 
 MainWindow::~MainWindow()
 {
+    m_browserPositionTimer.stop();
     m_presentScheduled = false;
     m_latestFrame = QImage();
     m_latestGpu = {};
@@ -112,9 +119,18 @@ MainWindow::~MainWindow()
 
 bool MainWindow::switchRenderer(IVideoRenderer::Backend backend)
 {
-    const QString reopenPath = m_player->isOpen() ? m_player->mediaInfo().filePath : QString();
-    const qint64 reopenPos = m_player->positionMs();
-    const bool wasPlaying = m_player->state() == FFmpegPlayer::State::Playing;
+    const QString reopenPath = isMediaLoaded() ? m_openMediaPath : QString();
+    const qint64 reopenPos = usesBrowserPlayback() && browserPlayback()
+                                 ? browserPlayback()->browserPositionMs()
+                                 : m_player->positionMs();
+    const bool wasPlaying = usesBrowserPlayback() ? m_browserPlaying
+                                                  : m_player->state() == FFmpegPlayer::State::Playing;
+
+    m_browserPositionTimer.stop();
+    m_browserPlaying = false;
+    if (auto *browser = browserPlayback()) {
+        browser->stopMedia();
+    }
     if (m_player->isOpen()) {
         m_player->stop();
     }
@@ -147,21 +163,16 @@ bool MainWindow::switchRenderer(IVideoRenderer::Backend backend)
     bindPlayerToRenderer();
 
     if (!reopenPath.isEmpty()) {
-        if (!m_player->open(reopenPath)) {
-            QMessageBox::warning(this, QStringLiteral("打开失败"), m_player->lastError());
-            setTransportEnabled(false);
-            return true;
-        }
-        showMediaSummary(m_player->mediaInfo());
-        const qint64 duration = qMax<qint64>(0, m_player->durationMs());
-        m_seekSlider->setRange(0, static_cast<int>(qMin(duration, static_cast<qint64>(INT_MAX))));
-        m_seekSlider->setEnabled(duration > 0);
-        setTransportEnabled(true);
+        openMediaAtPath(reopenPath);
         if (reopenPos > 0) {
-            m_player->seek(reopenPos);
+            if (auto *browser = browserPlayback()) {
+                browser->seekMedia(reopenPos);
+            } else {
+                m_player->seek(reopenPos);
+            }
         }
         if (wasPlaying) {
-            m_player->play();
+            onPlayPause();
         }
     } else if (!m_latestFrame.isNull()) {
         m_renderer->present(m_latestFrame);
@@ -213,17 +224,33 @@ void MainWindow::onOpen()
         return;
     }
 
+    m_browserPositionTimer.stop();
+    m_browserPlaying = false;
+    if (auto *browser = browserPlayback()) {
+        browser->stopMedia();
+    }
     m_player->stop();
 
-    if (!m_player->open(path)) {
-        QMessageBox::warning(this, QStringLiteral("打开失败"), m_player->lastError());
+    openMediaAtPath(path);
+}
+
+void MainWindow::openMediaAtPath(const QString &path)
+{
+    FFmpegVideoParser parser;
+    if (!parser.open(path)) {
+        QMessageBox::warning(this, QStringLiteral("打开失败"), parser.lastError());
         setTransportEnabled(false);
+        m_openMediaPath.clear();
+        m_browserDurationMs = -1;
         return;
     }
 
-    showMediaSummary(m_player->mediaInfo());
+    const MediaInfo info = parser.mediaInfo();
+    m_openMediaPath = path;
+    m_browserDurationMs = info.durationMs;
+    showMediaSummary(info);
 
-    const qint64 duration = qMax<qint64>(0, m_player->durationMs());
+    const qint64 duration = qMax<qint64>(0, info.durationMs);
     m_seekSlider->setRange(0, static_cast<int>(qMin(duration, static_cast<qint64>(INT_MAX))));
     m_seekSlider->setValue(0);
     m_seekSlider->setEnabled(duration > 0);
@@ -231,14 +258,55 @@ void MainWindow::onOpen()
     m_playBtn->setText(QStringLiteral("播放"));
     m_latestFrame = QImage();
     m_latestGpu = {};
-    if (m_renderer) {
-        m_renderer->clear(QStringLiteral("已加载，点击播放"));
+
+    if (auto *browser = browserPlayback()) {
+        m_player->close();
+        if (!browser->browserAvailable()) {
+            if (m_renderer) {
+                m_renderer->clear(QStringLiteral("CEF 未就绪，请查看上方错误提示"));
+            }
+        } else {
+            browser->openMedia(path);
+            if (m_renderer) {
+                m_renderer->clear(QStringLiteral("已加载，点击播放"));
+            }
+        }
+    } else {
+        if (!m_player->open(path)) {
+            QMessageBox::warning(this, QStringLiteral("打开失败"), m_player->lastError());
+            setTransportEnabled(false);
+            m_openMediaPath.clear();
+            return;
+        }
+        if (m_renderer) {
+            m_renderer->clear(QStringLiteral("已加载，点击播放"));
+        }
     }
     updateTimeLabel();
 }
 
 void MainWindow::onPlayPause()
 {
+    if (!isMediaLoaded()) {
+        return;
+    }
+
+    if (auto *browser = browserPlayback()) {
+        if (m_browserPlaying) {
+            browser->pauseMedia();
+            m_browserPlaying = false;
+            m_browserPositionTimer.stop();
+            m_playBtn->setText(QStringLiteral("播放"));
+        } else {
+            browser->playMedia();
+            m_browserPlaying = true;
+            m_browserPositionTimer.start();
+            m_playBtn->setText(QStringLiteral("暂停"));
+        }
+        updateTimeLabel();
+        return;
+    }
+
     if (!m_player->isOpen()) {
         return;
     }
@@ -251,6 +319,11 @@ void MainWindow::onPlayPause()
 
 void MainWindow::onStop()
 {
+    m_browserPositionTimer.stop();
+    m_browserPlaying = false;
+    if (auto *browser = browserPlayback()) {
+        browser->stopMedia();
+    }
     m_player->stop();
     m_seekSlider->setValue(0);
     m_latestFrame = QImage();
@@ -258,6 +331,7 @@ void MainWindow::onStop()
     if (m_renderer) {
         m_renderer->clear(QStringLiteral("已停止"));
     }
+    m_playBtn->setText(QStringLiteral("播放"));
     updateTimeLabel();
 }
 
@@ -268,12 +342,18 @@ void MainWindow::onSeekPressed()
 
 void MainWindow::onSeekReleased()
 {
-    if (!m_player->isOpen()) {
+    if (!isMediaLoaded()) {
         m_sliderPressed = false;
         return;
     }
 
     m_sliderPressed = false;
+    if (auto *browser = browserPlayback()) {
+        browser->seekMedia(m_seekSlider->value());
+        updateTimeLabel();
+        return;
+    }
+
     m_player->seek(m_seekSlider->value());
     updateTimeLabel();
 }
@@ -281,14 +361,15 @@ void MainWindow::onSeekReleased()
 void MainWindow::onSeekMoved(int value)
 {
     if (m_sliderPressed) {
+        const qint64 duration = usesBrowserPlayback() ? m_browserDurationMs : m_player->durationMs();
         m_timeLabel->setText(QStringLiteral("%1 / %2")
-                                 .arg(formatTime(value), formatTime(m_player->durationMs())));
+                                 .arg(formatTime(value), formatTime(duration)));
     }
 }
 
 void MainWindow::onFrameReady(const QImage &frame, qint64)
 {
-    if (frame.isNull()) {
+    if (usesBrowserPlayback() || frame.isNull()) {
         return;
     }
 
@@ -303,7 +384,7 @@ void MainWindow::onFrameReady(const QImage &frame, qint64)
 
 void MainWindow::onGpuFrameReady(GpuVideoFrame frame)
 {
-    if (!frame.isValid()) {
+    if (usesBrowserPlayback() || !frame.isValid()) {
         return;
     }
     m_latestFrame = QImage();
@@ -377,9 +458,11 @@ void MainWindow::showMediaSummary(const MediaInfo &info)
     text += QStringLiteral("码率: %1 bps\n").arg(info.bitrate);
     text += QStringLiteral("视频流: %1, 音频流: %2\n").arg(info.videoStreamIndex).arg(info.audioStreamIndex);
     text += QStringLiteral("解码: %1\n\n")
-                .arg(m_player->hardwareDecodeActive()
-                         ? QStringLiteral("D3D11VA 硬解（GPU 零拷贝）")
-                         : QStringLiteral("软解"));
+                .arg(usesBrowserPlayback()
+                         ? QStringLiteral("Chromium HTML5（CEF）")
+                         : (m_player->hardwareDecodeActive()
+                                ? QStringLiteral("D3D11VA 硬解（GPU 零拷贝）")
+                                : QStringLiteral("软解")));
 
     for (const MediaStreamInfo &s : info.streams) {
         text += QStringLiteral("---- stream #%1 [%2] ----\n").arg(s.index).arg(s.mediaType);
@@ -399,9 +482,48 @@ void MainWindow::showMediaSummary(const MediaInfo &info)
 
 void MainWindow::updateTimeLabel()
 {
-    const qint64 pos = m_sliderPressed ? m_seekSlider->value() : m_player->positionMs();
-    m_timeLabel->setText(QStringLiteral("%1 / %2")
-                             .arg(formatTime(pos), formatTime(m_player->durationMs())));
+    qint64 pos = 0;
+    qint64 duration = -1;
+    if (auto *browser = browserPlayback()) {
+        pos = m_sliderPressed ? m_seekSlider->value() : browser->browserPositionMs();
+        duration = m_browserDurationMs;
+    } else {
+        pos = m_sliderPressed ? m_seekSlider->value() : m_player->positionMs();
+        duration = m_player->durationMs();
+    }
+    m_timeLabel->setText(QStringLiteral("%1 / %2").arg(formatTime(pos), formatTime(duration)));
+}
+
+IBrowserPlayback *MainWindow::browserPlayback() const
+{
+    return dynamic_cast<IBrowserPlayback *>(m_renderer.get());
+}
+
+bool MainWindow::usesBrowserPlayback() const
+{
+    return browserPlayback() != nullptr;
+}
+
+bool MainWindow::isMediaLoaded() const
+{
+    return !m_openMediaPath.isEmpty();
+}
+
+void MainWindow::onBrowserPositionTick()
+{
+    auto *browser = browserPlayback();
+    if (!browser) {
+        return;
+    }
+    browser->pollBrowserPosition();
+    if (!m_sliderPressed && m_seekSlider->isEnabled()) {
+        const qint64 pos = browser->browserPositionMs();
+        m_seekSlider->blockSignals(true);
+        const qint64 clamped = qBound(qint64(0), pos, qint64(m_seekSlider->maximum()));
+        m_seekSlider->setValue(static_cast<int>(clamped));
+        m_seekSlider->blockSignals(false);
+    }
+    updateTimeLabel();
 }
 
 void MainWindow::setTransportEnabled(bool enabled)

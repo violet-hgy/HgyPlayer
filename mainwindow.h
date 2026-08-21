@@ -4,6 +4,7 @@
 #include "FFmpegPlayer.h"
 #include "GpuVideoFrame.h"
 #include "MediaTypes.h"
+#include "render/IBrowserPlayback.h"
 #include "render/IVideoRenderer.h"
 
 #include <QComboBox>
@@ -12,6 +13,7 @@
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QSlider>
+#include <QTimer>
 
 #include <memory>
 
@@ -48,8 +50,13 @@ private slots:
     void onPlayerError(const QString &message);
     void onPlaybackFinished();
     void presentVideoFrame();
+    void onBrowserPositionTick();
 
 private:
+    IBrowserPlayback *browserPlayback() const;
+    bool usesBrowserPlayback() const;
+    bool isMediaLoaded() const;
+    void openMediaAtPath(const QString &path);
     void showMediaSummary(const MediaInfo &info);
     void updateTimeLabel();
     void setTransportEnabled(bool enabled);
@@ -77,6 +84,11 @@ private:
     QImage m_latestFrame;
     GpuVideoFrame m_latestGpu;
     bool m_presentScheduled = false;
+
+    QString m_openMediaPath;
+    qint64 m_browserDurationMs = -1;
+    bool m_browserPlaying = false;
+    QTimer m_browserPositionTimer;
 };
 
 #endif // MAINWINDOW_H
