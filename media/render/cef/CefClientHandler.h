@@ -28,6 +28,11 @@ public:
     void OnLoadEnd(CefRefPtr<CefBrowser> browser,
                    CefRefPtr<CefFrame> frame,
                    int httpStatusCode) override;
+    bool OnConsoleMessage(CefRefPtr<CefBrowser> browser,
+                          cef_log_severity_t level,
+                          const CefString &message,
+                          const CefString &source,
+                          int line) override;
 
     CefRefPtr<CefBrowser> browser() const { return m_browser; }
 

@@ -8,6 +8,9 @@ void CefAppHandler::OnBeforeCommandLineProcessing(const CefString &process_type,
         return;
     }
     command_line->AppendSwitch("do-not-de-elevate");
+    command_line->AppendSwitch("disable-gpu");
+    command_line->AppendSwitch("disable-gpu-compositing");
+    command_line->AppendSwitch("disable-gpu-vsync");
 }
 
 CefAppHandler::CefAppHandler() = default;

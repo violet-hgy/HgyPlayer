@@ -260,15 +260,35 @@ void MainWindow::openMediaAtPath(const QString &path)
     m_latestGpu = {};
 
     if (auto *browser = browserPlayback()) {
+        bool likelyUnsupportedCodec = false;
+        for (const MediaStreamInfo &stream : info.streams) {
+            if (stream.mediaType != QLatin1String("video")) {
+                continue;
+            }
+            const QString codec = stream.codecName.toLower();
+            if (codec.contains(QStringLiteral("hevc")) || codec.contains(QStringLiteral("h265"))
+                || codec.contains(QStringLiteral("h.265"))) {
+                likelyUnsupportedCodec = true;
+                break;
+            }
+        }
+
         m_player->close();
         if (!browser->browserAvailable()) {
             if (m_renderer) {
                 m_renderer->clear(QStringLiteral("CEF 未就绪，请查看上方错误提示"));
             }
-        } else {
-            browser->openMedia(path);
+        } else if (likelyUnsupportedCodec) {
             if (m_renderer) {
-                m_renderer->clear(QStringLiteral("已加载，点击播放"));
+                m_renderer->clear(
+                    QStringLiteral("Chromium HTML5 当前无法解码 HEVC(H.265) 视频。\n"
+                                   "请切换到 D3D11 硬解 / OpenGL 后端播放该文件。"));
+            }
+        } else {
+            if (!browser->openMedia(path)) {
+                if (m_renderer) {
+                    m_renderer->clear(QStringLiteral("CEF 媒体加载失败"));
+                }
             }
         }
     } else {

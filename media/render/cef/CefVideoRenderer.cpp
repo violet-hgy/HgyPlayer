@@ -4,9 +4,11 @@
 #include "ICefBrowserHost.h"
 
 #include <QCoreApplication>
+#include <QDateTime>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
+#include <QFileInfo>
 #include <QJsonDocument>
 #include <QLabel>
 #include <QResizeEvent>
@@ -31,6 +33,7 @@ struct CefVideoRenderer::Private
     qint64 estimatedPositionMs = 0;
     bool playing = false;
     bool pageReady = false;
+    bool autoPlayWhenReady = false;
 
     void syncBrowserSize();
     void ensureBrowser();
@@ -40,6 +43,22 @@ struct CefVideoRenderer::Private
 };
 
 namespace {
+void appendCefPlayerLog(const QString &line)
+{
+    QString dir = QDir::currentPath();
+    if (QCoreApplication::instance()) {
+        dir = QCoreApplication::applicationDirPath();
+    }
+    const QString logPath = QDir(dir).filePath(QStringLiteral("cef_player.log"));
+    QFile f(logPath);
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text)) {
+        return;
+    }
+    const QString out = QStringLiteral("%1 %2\n")
+                            .arg(QDateTime::currentDateTime().toString(Qt::ISODateWithMs), line);
+    f.write(out.toUtf8());
+}
+
 QString cefTestPageUrl()
 {
     return QStringLiteral("https://www.baidu.com");
@@ -56,14 +75,24 @@ QString defaultPlayerHtml()
         "<video id=\"player\" playsinline preload=\"auto\"></video>"
         "<script>(function(){var v=document.getElementById('player'),h=document.getElementById('hint');"
         "function show(t){h.textContent=t;h.style.display=t?'flex':'none';}"
-        "v.addEventListener('playing',function(){show('');});"
-        "v.addEventListener('loadeddata',function(){show('');});"
-        "v.addEventListener('error',function(){show('无法解码此媒体');});"
-        "v.addEventListener('emptied',function(){show('HgyPlayer · CEF');});"
-        "window.hgyPlayer={load:function(u){v.src=u;v.load();},"
-        "play:function(){return v.play();},pause:function(){v.pause();},"
-        "stop:function(){v.pause();v.currentTime=0;},"
-        "seek:function(s){if(!isNaN(s))v.currentTime=s;},"
+        "function diag(tag){var err=v.error?(' code='+v.error.code):'';"
+        "console.log('[HGY] '+tag+' readyState='+v.readyState+' networkState='+v.networkState+err+' src='+v.currentSrc);}"
+        "v.addEventListener('loadstart',function(){show('正在加载媒体...');diag('loadstart');});"
+        "v.addEventListener('loadedmetadata',function(){show('');diag('loadedmetadata');});"
+        "v.addEventListener('loadeddata',function(){show('');diag('loadeddata');});"
+        "v.addEventListener('canplay',function(){diag('canplay');});"
+        "v.addEventListener('playing',function(){show('');diag('playing');});"
+        "v.addEventListener('stalled',function(){show('网络/解码阻塞');diag('stalled');});"
+        "v.addEventListener('waiting',function(){show('缓冲中...');diag('waiting');});"
+        "v.addEventListener('error',function(){show('无法解码此媒体');diag('error');});"
+        "v.addEventListener('emptied',function(){show('HgyPlayer · CEF');diag('emptied');});"
+        "window.hgyPlayer={load:function(u){v.src=u;v.load();diag('load-call');},"
+        "play:function(){diag('play-call');var p=v.play();"
+        "if(p&&p.then){p.then(function(){diag('play-ok');}).catch(function(e){console.log('[HGY] play-fail '+e);show('播放失败: '+e);diag('play-fail');});}"
+        "return p;},"
+        "pause:function(){v.pause();diag('pause-call');},"
+        "stop:function(){v.pause();v.currentTime=0;diag('stop-call');},"
+        "seek:function(s){if(!isNaN(s))v.currentTime=s;diag('seek-call');},"
         "currentTimeMs:function(){return Math.round((v.currentTime||0)*1000);}};"
         "})();</script></body></html>");
 }
@@ -74,19 +103,17 @@ QString ensurePlayerPageOnDisk()
     dir.mkpath(QStringLiteral("cef"));
     const QString path = dir.filePath(QStringLiteral("cef/player.html"));
     QFile file(path);
-    if (!file.exists()) {
-        if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-            return {};
-        }
-        file.write(defaultPlayerHtml().toUtf8());
-        file.close();
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        return {};
     }
+    file.write(defaultPlayerHtml().toUtf8());
+    file.close();
     return path;
 }
 
 QString jsStringLiteral(const QString &text)
 {
-    return QString::fromUtf8(QJsonDocument::fromVariant(text).toJson());
+    return QString::fromUtf8(QJsonDocument::fromVariant(text).toJson(QJsonDocument::Compact));
 }
 } // namespace
 
@@ -140,6 +167,7 @@ void CefVideoRenderer::Private::ensureBrowser()
     if (browserHost || !host || !CefRuntimeFacade::isInitialized()) {
         return;
     }
+    appendCefPlayerLog(QStringLiteral("[HGY] ensureBrowser begin"));
 
     browserHost = CefRuntimeFacade::createBrowserHost();
     if (!browserHost) {
@@ -154,15 +182,23 @@ void CefVideoRenderer::Private::ensureBrowser()
         QTimer::singleShot(0, self->host, [self]() { self->onPageLoaded(); });
     });
 
-    browserHost->navigateToUrl(cefTestPageUrl());
-
     if (!browserHost->create(host)) {
+        appendCefPlayerLog(QStringLiteral("[HGY] ensureBrowser create failed"));
         browserHost.reset();
         if (fallbackLabel) {
             fallbackLabel->show();
             fallbackLabel->setText(QStringLiteral("无法创建 CEF 浏览器窗口"));
         }
         return;
+    }
+
+    const QString playerPath = ensurePlayerPageOnDisk();
+    if (!playerPath.isEmpty()) {
+        appendCefPlayerLog(QStringLiteral("[HGY] navigate player page %1").arg(playerPath));
+        browserHost->navigateToUrl(QUrl::fromLocalFile(playerPath).toString());
+    } else {
+        appendCefPlayerLog(QStringLiteral("[HGY] load inline player html"));
+        browserHost->loadHtmlPage(defaultPlayerHtml());
     }
 
     if (fallbackLabel) {
@@ -173,7 +209,16 @@ void CefVideoRenderer::Private::ensureBrowser()
 
 void CefVideoRenderer::Private::onPageLoaded()
 {
+    appendCefPlayerLog(QStringLiteral("[HGY] onPageLoaded"));
     pageReady = true;
+    loadPendingMedia();
+    if (autoPlayWhenReady) {
+        runJs(QStringLiteral("window.hgyPlayer && window.hgyPlayer.play();"));
+        autoPlayWhenReady = false;
+        playing = true;
+        playClock.restart();
+        positionTimer.start();
+    }
     if (fallbackLabel) {
         fallbackLabel->hide();
     }
@@ -185,9 +230,12 @@ void CefVideoRenderer::Private::loadPendingMedia()
     if (!pageReady || pendingMediaUrl.isEmpty() || !browserHost) {
         return;
     }
+    appendCefPlayerLog(QStringLiteral("[HGY] loadPendingMedia url=%1").arg(pendingMediaUrl));
     const QString script = QStringLiteral("window.hgyPlayer && window.hgyPlayer.load(%1);")
                                .arg(jsStringLiteral(pendingMediaUrl));
     browserHost->executeJavaScript(script);
+    anchorPositionMs = 0;
+    estimatedPositionMs = 0;
 }
 
 void CefVideoRenderer::Private::runJs(const QString &script)
@@ -200,6 +248,7 @@ void CefVideoRenderer::Private::runJs(const QString &script)
 CefVideoRenderer::CefVideoRenderer(QWidget *parent)
     : d(std::make_unique<Private>())
 {
+    appendCefPlayerLog(QStringLiteral("[HGY] CefVideoRenderer ctor"));
     d->host = new Private::HostWidget(d.get(), parent);
 
     auto *layout = new QVBoxLayout(d->host);
@@ -224,7 +273,7 @@ CefVideoRenderer::CefVideoRenderer(QWidget *parent)
                 : err);
     } else {
         d->fallbackLabel->setText(
-            QStringLiteral("正在打开测试网页…\n%1").arg(cefTestPageUrl()));
+            QStringLiteral("CEF 就绪，等待加载媒体文件"));
     }
 
     d->positionTimer.setInterval(250);
@@ -279,8 +328,7 @@ bool CefVideoRenderer::browserAvailable() const
 
 bool CefVideoRenderer::openMedia(const QString &filePath)
 {
-    Q_UNUSED(filePath);
-
+    appendCefPlayerLog(QStringLiteral("[HGY] openMedia path=%1").arg(filePath));
     if (!browserAvailable()) {
         if (d->fallbackLabel) {
             d->fallbackLabel->show();
@@ -291,6 +339,22 @@ bool CefVideoRenderer::openMedia(const QString &filePath)
         return false;
     }
 
+    if (!QFileInfo::exists(filePath)) {
+        if (d->fallbackLabel) {
+            d->fallbackLabel->show();
+            d->fallbackLabel->setText(QStringLiteral("媒体文件不存在：\n%1").arg(filePath));
+        }
+        return false;
+    }
+
+    d->mediaPath = filePath;
+    d->pendingMediaUrl = QUrl::fromLocalFile(filePath).toString();
+    d->pageReady = false;
+    d->autoPlayWhenReady = false;
+    d->playing = false;
+    d->anchorPositionMs = 0;
+    d->estimatedPositionMs = 0;
+
     d->ensureBrowser();
     if (!d->browserHost) {
         if (d->fallbackLabel) {
@@ -300,19 +364,41 @@ bool CefVideoRenderer::openMedia(const QString &filePath)
         return false;
     }
 
+    if (d->browserHost->isCreated()) {
+        // Reload the player page per media open so JS state starts clean.
+        const QString playerPath = ensurePlayerPageOnDisk();
+        if (!playerPath.isEmpty()) {
+            d->browserHost->navigateToUrl(QUrl::fromLocalFile(playerPath).toString());
+        } else {
+            d->browserHost->loadHtmlPage(defaultPlayerHtml());
+            d->pageReady = true;
+            d->loadPendingMedia();
+        }
+    }
+
+    if (d->fallbackLabel) {
+        d->fallbackLabel->show();
+        d->fallbackLabel->setText(QStringLiteral("媒体已加载，点击播放"));
+    }
+
     return true;
 }
 
 void CefVideoRenderer::playMedia()
 {
+    appendCefPlayerLog(QStringLiteral("[HGY] playMedia pageReady=%1 autoPlayWhenReady=%2")
+                           .arg(d->pageReady ? QStringLiteral("1") : QStringLiteral("0"),
+                                d->autoPlayWhenReady ? QStringLiteral("1") : QStringLiteral("0")));
     if (!browserAvailable()) {
         return;
     }
     d->ensureBrowser();
     if (!d->pageReady) {
+        d->autoPlayWhenReady = true;
         return;
     }
     d->runJs(QStringLiteral("window.hgyPlayer && window.hgyPlayer.play();"));
+    d->autoPlayWhenReady = false;
     d->playing = true;
     d->playClock.restart();
     d->positionTimer.start();
@@ -320,9 +406,11 @@ void CefVideoRenderer::playMedia()
 
 void CefVideoRenderer::pauseMedia()
 {
+    appendCefPlayerLog(QStringLiteral("[HGY] pauseMedia"));
     if (!browserAvailable()) {
         return;
     }
+    d->autoPlayWhenReady = false;
     pollBrowserPosition();
     d->runJs(QStringLiteral("window.hgyPlayer && window.hgyPlayer.pause();"));
     d->playing = false;
@@ -331,8 +419,10 @@ void CefVideoRenderer::pauseMedia()
 
 void CefVideoRenderer::stopMedia()
 {
+    appendCefPlayerLog(QStringLiteral("[HGY] stopMedia"));
     if (!browserAvailable()) {
         d->playing = false;
+        d->autoPlayWhenReady = false;
         d->anchorPositionMs = 0;
         d->estimatedPositionMs = 0;
         d->positionTimer.stop();
@@ -340,6 +430,7 @@ void CefVideoRenderer::stopMedia()
     }
     d->runJs(QStringLiteral("window.hgyPlayer && window.hgyPlayer.stop();"));
     d->playing = false;
+    d->autoPlayWhenReady = false;
     d->anchorPositionMs = 0;
     d->estimatedPositionMs = 0;
     d->positionTimer.stop();

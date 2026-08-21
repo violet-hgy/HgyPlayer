@@ -2,6 +2,9 @@
 
 #include "CefClientHandler.h"
 
+#include <QCoreApplication>
+#include <QEventLoop>
+#include <QThread>
 #include <QUrl>
 #include <QWidget>
 
@@ -97,16 +100,25 @@ void CefBrowserHostImpl::destroy()
     m_pageLoaded = false;
     m_pendingUrl.clear();
     m_pendingHtml.clear();
+    CefRefPtr<CefBrowserHost> hostToClose;
     if (m_browser) {
         if (CefRefPtr<CefBrowserHost> host = m_browser->GetHost()) {
-            host->CloseBrowser(true);
+            hostToClose = host;
         }
-        m_browser = nullptr;
     } else if (m_client && m_client->browser()) {
         if (CefRefPtr<CefBrowserHost> host = m_client->browser()->GetHost()) {
-            host->CloseBrowser(true);
+            hostToClose = host;
         }
     }
+    if (hostToClose) {
+        hostToClose->CloseBrowser(true);
+        // Give CEF a short chance to process close tasks before shutdown.
+        for (int i = 0; i < 20; ++i) {
+            QCoreApplication::processEvents(QEventLoop::AllEvents, 10);
+            QThread::msleep(5);
+        }
+    }
+    m_browser = nullptr;
     m_client = nullptr;
     m_created = false;
     m_parent.clear();
@@ -210,5 +222,7 @@ void CefBrowserHostImpl::ensureBrowserSize(int width, int height)
     Q_UNUSED(width);
     Q_UNUSED(height);
 #endif
-    host->WasResized();
+    // For windowed (SetAsChild) mode, resizing the native child window is sufficient.
+    // Calling WasResized() is only required for OSR and can trigger "Not implemented"
+    // logs in some CEF builds.
 }

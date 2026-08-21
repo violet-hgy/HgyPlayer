@@ -10,6 +10,8 @@
 
 #include <memory>
 
+class QTimer;
+
 class CefRuntimeImpl
 {
 public:
@@ -25,7 +27,11 @@ public:
     std::unique_ptr<ICefBrowserHost> createBrowserHost();
 
 private:
+    void startMessageLoopPump();
+    void stopMessageLoopPump();
+
     bool m_initialized = false;
+    std::unique_ptr<QTimer> m_messageLoopTimer;
 };
 
 #endif // CEFRUNTIMEIMPL_H

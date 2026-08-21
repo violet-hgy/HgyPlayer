@@ -10,6 +10,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QString>
+#include <QTimer>
 
 #include <memory>
 
@@ -139,8 +140,8 @@ void assignCefString(cef_string_t *dest, const QString &text)
 void populateCefSettings(CefSettings &settings, const CefPathConfig &cfg)
 {
     settings.no_sandbox = true;
-    settings.command_line_args_disabled = true;
-    settings.multi_threaded_message_loop = true;
+    settings.command_line_args_disabled = false;
+    settings.multi_threaded_message_loop = false;
     settings.windowless_rendering_enabled = false;
 
     if (!cfg.resourcesDir.isEmpty()) {
@@ -241,6 +242,7 @@ bool CefRuntimeImpl::initialize(int argc, char **argv)
     g_lastInitError.clear();
 
     m_initialized = true;
+    startMessageLoopPump();
     return true;
 }
 
@@ -249,6 +251,7 @@ void CefRuntimeImpl::shutdown()
     if (!m_initialized) {
         return;
     }
+    stopMessageLoopPump();
     CefShutdown();
     m_initialized = false;
 }
@@ -264,4 +267,29 @@ std::unique_ptr<ICefBrowserHost> CefRuntimeImpl::createBrowserHost()
 QString CefRuntimeImpl::lastInitError()
 {
     return g_lastInitError;
+}
+
+void CefRuntimeImpl::startMessageLoopPump()
+{
+    if (m_messageLoopTimer || !QCoreApplication::instance()) {
+        return;
+    }
+    m_messageLoopTimer = std::make_unique<QTimer>();
+    m_messageLoopTimer->setInterval(10);
+    QObject::connect(m_messageLoopTimer.get(), &QTimer::timeout, []() {
+        CefDoMessageLoopWork();
+    });
+    m_messageLoopTimer->start();
+}
+
+void CefRuntimeImpl::stopMessageLoopPump()
+{
+    if (!m_messageLoopTimer) {
+        return;
+    }
+    m_messageLoopTimer->stop();
+    m_messageLoopTimer.reset();
+    for (int i = 0; i < 10; ++i) {
+        CefDoMessageLoopWork();
+    }
 }
